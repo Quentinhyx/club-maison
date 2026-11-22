@@ -1,0 +1,33 @@
+{
+  "name": "club-maison",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite --config vite.web.config.ts",
+    "build": "vite build --config vite.web.config.ts",
+    "build:ext": "vite build --config vite.extension.config.ts",
+    "typecheck": "tsc --noEmit -p tsconfig.json",
+    "test": "tsx shared/brain/brain.test.ts && tsx shared/audio/recipes.test.ts && tsx shared/analysis/analysis.test.ts && tsx shared/demo/demo.test.ts && tsx api/_lib/store.test.ts",
+    "dev:console": "vite --config vite.console.config.ts",
+    "build:console": "vite build --config vite.console.config.ts"
+  },
+  "dependencies": {
+    "@upstash/redis": "^1.41.0",
+    "qrcode": "^1.5.4",
+    "react": "^19.3.1",
+    "react-dom": "^19.3.1"
+  },
+  "devDependencies": {
+    "@types/chrome": "^0.3.7",
+    "@types/node": "^26.6.6",
+    "@types/qrcode": "^1.5.6",
+    "@types/react": "^19.3.0",
+    "@types/react-dom": "^19.3.0",
+    "@vercel/node": "^32.0.0",
+    "@vitejs/plugin-react": "^6.3.0",
+    "tsx": "^4.23.15",
+    "typescript": "^7.0.2",
+    "vite": "^8.3.8"
+  }
+}
