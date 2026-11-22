@@ -40,7 +40,8 @@ const KEY = 'clubMaison.settings';
 /** Console servie en ligne (https, hors localhost) : l'API des invités est sur le même site. */
 const hostedOrigin: string = (() => {
   try {
-    if (isExtension || location.protocol !== 'https:') return '';
+    if (isExtension) return 'https://club-maison.vercel.app';
+    if (location.protocol !== 'https:') return '';
     return /^(localhost|127\.|\[::1\])/.test(location.hostname) ? '' : location.origin;
   } catch {
     return '';
