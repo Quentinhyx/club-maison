@@ -56,8 +56,11 @@ export function App({ initial }: { initial: ConsoleSettings }) {
   };
 
   const openAssistant = () => {
-    const url = isExtension ? chrome.runtime.getURL('diagnostic.html') : 'diagnostic.html';
-    window.open(url, '_blank');
+    if (!isExtension) {
+      window.alert('L’assistant d’installation teste Deezer : il n’existe que dans l’extension Chrome. Ouvre la console en cliquant sur l’icône Club Maison (barre d’extensions de Chrome).');
+      return;
+    }
+    window.open(chrome.runtime.getURL('diagnostic.html'), '_blank');
   };
 
   return (
