@@ -114,7 +114,7 @@ function App() {
           else if (!r.media.current) set(k, { st: 'warn', detail: 'Onglet connecté, mais aucun son intercepté pour l’instant.', advice: 'Lance n’importe quel titre dans cet onglet, puis relance ce test.', extra });
           else set(k, { st: 'ok', detail: `Lecteur piloté${r.playerObject.found ? ' (objet lecteur + élément média)' : ' (élément média)'}.`, extra });
         } catch (e) {
-          set(k, { st: 'fail', detail: String((e as Error).message), advice: 'Recharge l’onglet Deezer de cette platine (l’extension doit y être active), puis réessaie.' });
+          set(k, { st: 'fail', detail: String((e as Error).message), advice: 'Recharge les DEUX onglets Deezer (fenêtre normale et fenêtre privée) : un onglet ouvert avant l’installation de l’extension reste invisible pour elle. Puis réessaie.' });
         }
       }
       if (b && want('rate')) {
@@ -152,7 +152,7 @@ function App() {
           if (lvl < 0.0005) set(k, { st: 'fail', detail: `Capture acceptée mais muette (${db.toFixed(0)} dBFS).`, advice: 'Vérifie qu’un titre joue dans cet onglet. Si c’est muet malgré tout, utilise la solution BlackHole.' });
           else set(k, { st: 'ok', detail: `Son capté (${db.toFixed(0)} dBFS).` });
         } catch (e) {
-          set(k, { st: 'fail', detail: (e as Error).message, advice: d === 'B' ? 'Si Chrome refuse de capturer la fenêtre privée, passe à la solution BlackHole (Réglages > Source des platines).' : 'Ferme la console si elle est ouverte (un onglet ne peut être capturé qu’une fois), clique sur l’icône Club Maison dans l’onglet Deezer, puis réessaie.' });
+          set(k, { st: 'fail', detail: (e as Error).message, advice: d === 'B' ? 'Si Chrome refuse de capturer la fenêtre privée, passe à la solution BlackHole (Réglages > Source des platines).' : 'Va dans l’onglet Deezer de cette platine et clique une fois sur l’icône Club Maison (rien ne s’affiche, c’est normal), reviens ici et clique sur Tester. À refaire si tu recharges l’onglet Deezer.' });
         }
       }
       if (b && want('both')) {

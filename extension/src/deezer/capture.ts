@@ -43,7 +43,7 @@ export async function captureTab(targetTabId: number): Promise<MediaStream> {
 export function explainCaptureError(msg?: string): string {
   const m = msg ?? '';
   if (/invoked|activeTab/i.test(m)) {
-    return 'Chrome demande d’autoriser la capture : va dans l’onglet Deezer de cette platine et clique une fois sur l’icône Club Maison (barre d’extensions), puis réessaie.';
+    return 'Chrome demande d’autoriser la capture : va dans l’onglet Deezer de cette platine, clique une fois sur l’icône Club Maison (rien ne s’affiche, c’est normal), puis réessaie.';
   }
   if (/active stream|already/i.test(m)) return 'Cet onglet est déjà capturé (ferme les autres consoles ouvertes).';
   if (/incognito|off.?the.?record/i.test(m)) {
