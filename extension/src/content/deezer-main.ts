@@ -234,9 +234,10 @@ declare global {
   const status = (): DeckStatus => {
     if (errorText) return 'error';
     if (loading) return 'loading';
-    if (!expected) return 'empty';
-    if (ended) return 'ended';
     const m = el();
+    // morceau lancé à la main dans Deezer (pas par la console) : on dit quand même s'il joue
+    if (!expected) return m && !m.paused ? 'playing' : 'empty';
+    if (ended) return 'ended';
     if (m && !m.paused) return 'playing';
     return ready ? 'ready' : 'paused';
   };
@@ -248,7 +249,8 @@ declare global {
       canSeek: seekVerified ?? !!m,
       canSetRate: !!m && !webAudioOnly,
       preservesPitch: !!m && 'preservesPitch' in m,
-      maxRateDelta: 0.08,
+      // élément média avec preservesPitch : jusqu'à ±30 % (re-edits) ; sans, on reste à ±8 %
+      maxRateDelta: !!m && 'preservesPitch' in m && !webAudioOnly ? 0.3 : 0.08,
     };
   };
 
