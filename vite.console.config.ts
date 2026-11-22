@@ -53,6 +53,8 @@ function deezerProxy(): Plugin {
 
 export default defineConfig({
   root: resolve(import.meta.dirname, 'extension'),
+  // en ligne, la console est servie sous /console/ (vercel.json) ; en localhost, à la racine
+  base: process.env.CONSOLE_BASE ?? (process.env.VERCEL ? '/console/' : '/'),
   plugins: [react(), deezerProxy()],
   server: { port: 5190, strictPort: false, open: false },
   preview: { port: 5190 },

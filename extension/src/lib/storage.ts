@@ -37,16 +37,30 @@ export const DEFAULT_CONSOLE_SETTINGS: ConsoleSettings = {
 
 const KEY = 'clubMaison.settings';
 
+/** Console servie en ligne (https, hors localhost) : l'API des invités est sur le même site. */
+const hostedOrigin: string = (() => {
+  try {
+    if (isExtension || location.protocol !== 'https:') return '';
+    return /^(localhost|127\.|\[::1\])/.test(location.hostname) ? '' : location.origin;
+  } catch {
+    return '';
+  }
+})();
+
+function withDefaults(s: ConsoleSettings): ConsoleSettings {
+  return s.apiUrl ? s : { ...s, apiUrl: hostedOrigin };
+}
+
 export async function loadSettings(): Promise<ConsoleSettings> {
   try {
     if (isExtension) {
       const r = await chrome.storage.local.get(KEY);
-      return { ...DEFAULT_CONSOLE_SETTINGS, ...((r?.[KEY] as Partial<ConsoleSettings>) ?? {}) };
+      return withDefaults({ ...DEFAULT_CONSOLE_SETTINGS, ...((r?.[KEY] as Partial<ConsoleSettings>) ?? {}) });
     }
     const raw = localStorage.getItem(KEY);
-    return { ...DEFAULT_CONSOLE_SETTINGS, ...(raw ? JSON.parse(raw) : {}) };
+    return withDefaults({ ...DEFAULT_CONSOLE_SETTINGS, ...(raw ? JSON.parse(raw) : {}) });
   } catch {
-    return { ...DEFAULT_CONSOLE_SETTINGS };
+    return withDefaults({ ...DEFAULT_CONSOLE_SETTINGS });
   }
 }
 

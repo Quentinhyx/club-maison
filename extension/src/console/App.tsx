@@ -75,7 +75,7 @@ export function App({ initial }: { initial: ConsoleSettings }) {
         {fast && <span className="chip">morceaux courts</span>}
         {!isExtension && (
           <span className="chip" title="Deezer et la capture d’onglet sont disponibles dans l’extension Chrome.">
-            localhost
+            {location.hostname === "localhost" || location.hostname.startsWith("127.") ? "localhost" : "en ligne"}
           </span>
         )}
         <span className={`chip ${manual ? 'warn' : 'accent'}`}>{manual ? 'MANUEL' : 'PILOTE AUTO'}</span>
