@@ -293,12 +293,13 @@ const flush = () => new Promise((r) => setTimeout(r, 0));
   const rates = t.decks.B.calls.filter((x) => x.op === 'rate').map((x) => x.arg as number);
   ok(rates.length > 1, 'calage de phase : plusieurs corrections de vitesse');
   ok(rates.every((r) => r >= 0.92 && r <= 1.08), 'vitesses bornées à ±8 %');
-  ok(Math.abs(rates[rates.length - 1] - 1.02) < 0.01, `vitesse finale proche du rate de base (${rates[rates.length - 1]})`);
   t.mixer.setParam('A.gain', 0);
   await t.step(32 * spb + 6);
   ok(t.decks.A.calls.some((x) => x.op === 'pause'), 'sortant coupé après la transition');
   ok(t.c.getSnapshot().history.some((h) => h.track.id === 2), 'entrant ajouté à l’historique');
   ok(!t.c.getSnapshot().transition, 'transition terminée');
+  const rr = t.decks.B.calls.filter((x) => x.op === 'rate').map((x) => x.arg as number);
+  ok(Math.abs(rr[rr.length - 1] - 1.02) < 0.002, `vitesse revenue au rate de base après la transition (${rr[rr.length - 1]})`);
   t.c.stop();
 }
 

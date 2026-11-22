@@ -445,10 +445,18 @@ export class Conductor {
       history: this.history,
       activeTransition: this.tr?.plan,
     };
-    // extra reconnu par shared/brain (BrainInputExtras) : analyses des sons de la file
-    (input as BrainInput & { analyses?: TrackAnalysis[] }).analyses = this.queue
-      .map((q) => this.getAnalysis(q.track.id))
-      .filter((a): a is TrackAnalysis => !!a);
+    // toutes les analyses connues (file, candidats, platines) : le cerveau juge ainsi les re-edits avant chargement
+    const analyses: Record<number, TrackAnalysis> = {};
+    for (const [id, a] of this.analyses) analyses[id] = a;
+    for (const q of this.queue) {
+      const a = this.getAnalysis(q.track.id);
+      if (a) analyses[q.track.id] = a;
+    }
+    for (const id of DECK_IDS) {
+      const a = decks[id].analysis;
+      if (a) analyses[a.trackId] = a;
+    }
+    (input as BrainInput & { analyses?: Record<number, TrackAnalysis> }).analyses = analyses;
     try {
       return this.d.brain.tick(input) ?? [];
     } catch (e) {
@@ -485,7 +493,6 @@ export class Conductor {
           this.log('warn', `Chargement ignoré sur ${dec.deck} : elle joue encore la sortie.`);
           break;
         }
-        this.log('brain', `Charge « ${dec.track.title} » sur ${dec.deck} : ${dec.reason}`);
         void this.loadDeck(dec.deck, dec.track, dec.startAt, dec.reason);
         break;
       case 'transition':
@@ -495,7 +502,6 @@ export class Conductor {
         try {
           this.d.mixer.fx(dec.cue);
           this.activeFx.push({ cue: dec.cue, endCtx: dec.cue.atCtx + (dec.cue.beats * 60) / dec.cue.bpm });
-          if (dec.cue.reason) this.log('brain', `Effet ${dec.cue.kind} : ${dec.cue.reason}`);
         } catch (e) {
           this.log('warn', `Effet ${dec.cue.kind} impossible : ${errMsg(e)}`);
         }
@@ -512,7 +518,6 @@ export class Conductor {
         try {
           this.d.mixer.startGroove?.(dec.plan);
           this.groove = { plan: dec.plan };
-          this.log('brain', `Re-edit ${dec.plan.style} sous la platine ${dec.plan.deck} : ${dec.reason}`);
           if (!this.d.mixer.startGroove) this.log('warn', 'La table ne sait pas encore jouer de groove (version de shared/audio).');
         } catch (e) {
           this.log('warn', `Groove impossible : ${errMsg(e)}`);
@@ -546,7 +551,7 @@ export class Conductor {
     }
   }
 
-  private scheduleRate(deck: DeckId, rate: number, overBeats: number, now: number, reason: string): void {
+  private scheduleRate(deck: DeckId, rate: number, overBeats: number, now: number, _reason: string): void {
     const st = this.d.decks[deck].getState();
     if (!st.caps.canSetRate) {
       this.log('warn', `Platine ${deck} : vitesse non réglable, calage ignoré.`);
@@ -562,7 +567,6 @@ export class Conductor {
     const ramp = (this.d.rateRamp ?? defaultRateRamp)(this.baseRate[deck], target, now, Math.max(0, overBeats), bpm);
     this.ramps = this.ramps.filter((r) => r.deck !== deck).concat(ramp.map((r) => ({ deck, ...r })));
     if (!ramp.length) this.baseRate[deck] = target;
-    this.log('brain', `Vitesse ${deck} vers ${fmtRate(target)} sur ${overBeats} temps : ${reason}`);
   }
 
   /** Applique les paliers de rampe échus ; la platine en transition est gérée par driveTransition. */
@@ -754,7 +758,6 @@ export class Conductor {
     if (st.status !== 'playing' && st.caps.canSeek && tr.seekTo !== undefined && Math.abs(st.position - tr.seekTo) > 0.05) {
       void deck.seek(tr.seekTo).catch(() => {});
     }
-    this.log('brain', `Transition ${p.technique} ${p.from} vers ${p.to} sur ${p.beats} temps : ${p.reason}`);
   }
 
   private cancelTransition(why: string): void {

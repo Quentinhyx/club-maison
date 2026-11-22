@@ -342,6 +342,8 @@ export interface BrainInput {
   history: PlayedTrack[];
   /** Transition en cours, si la table en exécute une. */
   activeTransition?: TransitionPlan;
+  /** Analyses connues (file, candidats, platines), par trackId. */
+  analyses?: Record<number, TrackAnalysis>;
 }
 
 // ---------------------------------------------------------------------------------------------

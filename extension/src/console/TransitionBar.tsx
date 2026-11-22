@@ -20,7 +20,9 @@ export function TransitionBar({ engine, running }: { engine: Engine; running: bo
       const el = e[k];
       if (el && el.textContent !== s) el.textContent = s;
     };
-    const tr = f.transition;
+    const tr0 = f.transition;
+    // une fois la transition finie (relâchement de la vitesse), on repasse à l'écoute
+    const tr = tr0 && f.now <= tr0.endCtx + 0.5 ? tr0 : undefined;
     const root = e.root;
     if (!tr) {
       if (root) root.dataset.state = 'idle';
@@ -45,6 +47,7 @@ export function TransitionBar({ engine, running }: { engine: Engine; running: bo
     txt('tech', TECHNIQUE_LABELS[p.technique] ?? p.technique);
     txt('route', `${p.from} → ${p.to} · ${p.beats} temps · ${p.bpm.toFixed(1)} BPM`);
     txt('reason', p.reason);
+    if (e.reason && e.reason.title !== p.reason) e.reason.title = p.reason;
     const fx = f.activeFx.find((x) => x.cue.atCtx <= now && x.endCtx > now);
     txt('fx', fx ? `EFFET · ${FX_LABELS[fx.cue.kind]}` : '');
     if (now < p.startCtx) {

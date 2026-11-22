@@ -1,0 +1,34 @@
+{
+  "manifest_version": 3,
+  "name": "Club Maison",
+  "short_name": "Club Maison",
+  "version": "0.1.0",
+  "description": "DJ automatique pour une soirée à la maison : pilote deux lecteurs Deezer et mixe leur son.",
+  "minimum_chrome_version": "116",
+  "permissions": ["tabCapture", "tabs", "storage", "scripting", "activeTab"],
+  "host_permissions": [
+    "https://www.deezer.com/*",
+    "https://api.deezer.com/*",
+    "https://*.dzcdn.net/*",
+    "https://*.vercel.app/*"
+  ],
+  "incognito": "spanning",
+  "background": { "service_worker": "background.js", "type": "module" },
+  "action": { "default_title": "Club Maison : ouvrir la console" },
+  "content_scripts": [
+    {
+      "matches": ["https://www.deezer.com/*"],
+      "js": ["content/deezer-main.js"],
+      "run_at": "document_start",
+      "world": "MAIN",
+      "all_frames": false
+    },
+    {
+      "matches": ["https://www.deezer.com/*"],
+      "js": ["content/deezer-relay.js"],
+      "run_at": "document_start",
+      "all_frames": false
+    }
+  ],
+  "icons": { "16": "icons/icon16.png", "48": "icons/icon48.png", "128": "icons/icon128.png" }
+}

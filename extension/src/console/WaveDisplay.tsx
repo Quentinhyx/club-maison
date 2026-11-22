@@ -7,14 +7,14 @@ import type { DeckId, TransitionPlan } from '../../../shared/contracts';
 import type { Engine } from '../engine';
 import type { Waveform } from '../waveforms';
 import type { GrooveView } from '../conductor';
-import { getFrame, useFrame, type DeckView } from './frame';
+import { beatIndexAt, getFrame, useFrame, type DeckView } from './frame';
 
 const C = {
   bg: '#0B0B0C',
   lane: '#0E0E10',
   rule: '#2A2A2E',
   beat: 'rgba(11,11,12,0.45)',
-  bar: 'rgba(236,236,236,0.35)',
+  bar: 'rgba(236,236,236,0.5)',
   phrase: '#D7FF3A',
   low: '#2F6BFF',
   mid: '#FFB23F',
@@ -139,7 +139,7 @@ function drawWave(
       [wf.mid, C.mid, 0.72],
       [wf.high, C.high, 0.42],
     ];
-    const half = h / 2 - 3;
+    const half = (h / 2 - 3) * 0.86;
     const step = 2;
     for (const [arr, color, scale] of layers) {
       g.fillStyle = color;
@@ -171,20 +171,17 @@ function drawWave(
     g.fillText(v.state.track ? 'calcul de la forme d’onde…' : 'platine vide', cx + 12, mid + 4);
   }
 
-  // grille des temps
+  // grille des temps (par-dessus l'onde : temps sombres, mesures claires, phrases numérotées)
   if (v.grid && v.state.track) {
-    const { period, origin } = v.grid;
+    const { period, origin, times } = v.grid;
     const secHalf = (WAVE_SECONDS / 2) * rate;
-    const bStart = Math.ceil((v.pos - secHalf - origin) / period);
-    const bEnd = Math.floor((v.pos + secHalf - origin) / period);
     g.font = '600 10px "JetBrains Mono", ui-monospace, monospace';
-    for (let b = bStart; b <= bEnd; b++) {
-      const p = origin + b * period;
-      if (p < 0) continue;
+    const line = (b: number, p: number) => {
+      if (p < 0) return;
       const x = Math.round(cx + ((p - v.pos) / rate) * pxPerSec) + 0.5;
       const isPhrase = b % 32 === 0;
       const isBar = b % 4 === 0;
-      g.strokeStyle = isPhrase ? 'rgba(215,255,58,0.55)' : isBar ? C.bar : C.beat;
+      g.strokeStyle = isPhrase ? 'rgba(215,255,58,0.7)' : isBar ? C.bar : C.beat;
       g.lineWidth = isPhrase ? 1.5 : 1;
       g.beginPath();
       g.moveTo(x, y0);
@@ -194,6 +191,14 @@ function drawWave(
         g.fillStyle = C.phrase;
         g.fillText(String(b / 32 + 1), x + 3, y0 + h - 4);
       }
+    };
+    if (times) {
+      const i0 = Math.max(0, beatIndexAt(times, v.pos - secHalf));
+      for (let b = i0; b < times.length && times[b] <= v.pos + secHalf; b++) line(b, times[b]);
+    } else {
+      const bStart = Math.max(0, Math.ceil((v.pos - secHalf - origin) / period));
+      const bEnd = Math.floor((v.pos + secHalf - origin) / period);
+      for (let b = bStart; b <= bEnd; b++) line(b, origin + b * period);
     }
   }
 

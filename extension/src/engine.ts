@@ -4,16 +4,17 @@
  * anime à 60 i/s (formes d'onde, vumètres, grille des temps).
  */
 import type { DeckController, DeckId, DjSettings, Genre, TrackAnalysis, TrackRef } from '../../shared/contracts';
-import { Mixer, PreviewDeck, phaseNudge } from '../../shared/audio/index';
+import { Mixer, PreviewDeck, phaseNudge, rateRamp } from '../../shared/audio/index';
 import { LiveAnalyzer, analyzePreview, analyzeBuffer, getCachedAnalysis } from '../../shared/analysis/index';
 import { createBrain, DEFAULT_SETTINGS } from '../../shared/brain/index';
-import { SynthDeck, listDemoTracks, getDemoBuffer, isDemoTrack, computeWaveform } from '../../shared/demo/index';
+import { SynthDeck, listDemoTracks, getDemoBuffer, isDemoTrack, computeWaveformAsync } from '../../shared/demo/index';
 import { catalogForGenre, searchTracks } from '../../shared/deezer/index';
 import { Conductor, DECK_IDS, type AnalyzerLike } from './conductor';
 import { envFetch, envTrack, isExtension } from './lib/env';
 import { GuestApi } from './lib/guestApi';
 import type { ConsoleSettings, DeckMode } from './lib/storage';
 import { DeezerDeck } from './deezer/DeezerDeck';
+import { getBridge } from './deezer/bridge';
 import { Meters } from './meters';
 import { WaveformStore } from './waveforms';
 
@@ -93,7 +94,7 @@ export class Engine {
       B: new LiveAnalyzer(this.ctx, this.mixer.getDeckTap('B')),
     };
     this.meters = new Meters(this.ctx, this.mixer);
-    this.waves = new WaveformStore(this.ctx, this.mixer, computeWaveform);
+    this.waves = new WaveformStore(this.ctx, this.mixer, computeWaveformAsync);
 
     const settings: DjSettings = { ...DEFAULT_SETTINGS, ...(s.dj ?? {}) };
     if (opts.fast) Object.assign(settings, { minPlaySeconds: 25, maxPlaySeconds: 40 });
@@ -108,6 +109,7 @@ export class Engine {
       brain: createBrain(),
       settings,
       phaseNudge,
+      rateRamp,
       catalog: (genre, o) => (demo ? Promise.resolve(demoCatalog(genre, o.bpmMin, o.bpmMax)) : catalogForGenre(genre, { ...o, fetcher: envFetch })),
       analyze: (t) => this.analyze(t),
       cachedAnalysis: (id) => getCachedAnalysis(id),
@@ -120,6 +122,11 @@ export class Engine {
       timers: { setTimeout: (f, ms) => setTimeout(f, ms), clearTimeout: (h) => clearTimeout(h as number) },
       guestApi: s.apiUrl ? new GuestApi(s.apiUrl, s.hostKey, s.party) : null,
     });
+    if (this.mode === 'deezer') {
+      getBridge().onEvent((deck, _tab, evt) => {
+        if (evt.type === 'log') this.conductor.log('warn', `${deck ? `Platine ${deck} : ` : ''}${evt.msg}`);
+      });
+    }
     for (const id of DECK_IDS) {
       this.decks[id].on((e) => {
         if (e.type === 'track' && e.track) void this.waves.prepare(id, e.track);

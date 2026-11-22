@@ -71,6 +71,17 @@ export class GrooveMachine {
 
   start(plan: GroovePlan): void {
     if (this.disposed) return;
+    if (this.timer && this.segments.length > 0 && this.stopAt === Infinity) {
+      // Déjà en marche (construction du groove : on ajoute des parties) : le nouveau motif prend le
+      // relais à son startCtx, sans redémarrer ni rejouer les coups déjà programmés.
+      while (this.segments.length > 1 && this.segments[this.segments.length - 1].plan.startCtx > this.cursor) {
+        this.segments.pop();
+      }
+      const switchAt = Math.max(plan.startCtx, this.cursor);
+      this.segments[this.segments.length - 1].until = switchAt;
+      this.segments.push({ plan: { ...plan, startCtx: switchAt }, until: Infinity });
+      return;
+    }
     this.segments = [{ plan, until: Infinity }];
     this.stopAt = Infinity;
     this.cursor = Math.max(plan.startCtx, this.ctx.currentTime);

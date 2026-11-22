@@ -3,3 +3,5 @@ dist
 extension-dist
 .vercel
 .env*
+extension/screenshots
+web/screenshots

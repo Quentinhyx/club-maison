@@ -5,7 +5,7 @@
  */
 import { useEffect, useRef } from 'react';
 import type { DeckId, DeckState, TrackAnalysis } from '../../../shared/contracts';
-import { getDemoSpec } from '../../../shared/demo/tracks';
+import { getDemoMeta } from '../../../shared/demo/index';
 import type { Engine } from '../engine';
 import type { ActiveFx, TransitionView } from '../conductor';
 
@@ -47,6 +47,21 @@ export interface Grid {
   origin: number;
   bpm: number;      // tempo du morceau à vitesse 1
   live: boolean;    // grille issue de l'analyse en direct
+  /** Instants exacts de chaque temps (morceaux démo, y compris à tempo libre). */
+  times?: Float64Array;
+}
+
+/** Indice du dernier temps <= pos dans une liste triée. */
+export function beatIndexAt(times: Float64Array, pos: number): number {
+  let lo = 0;
+  let hi = times.length - 1;
+  if (pos < times[0]) return -1;
+  while (lo < hi) {
+    const mid = (lo + hi + 1) >> 1;
+    if (times[mid] <= pos) lo = mid;
+    else hi = mid - 1;
+  }
+  return lo;
 }
 
 export interface DeckView {
@@ -67,8 +82,12 @@ export interface DeckView {
 export function deckGrid(st: DeckState, analysis: TrackAnalysis | undefined, nowCtx: number): Grid | undefined {
   const t = st.track;
   if (!t) return undefined;
-  const spec = getDemoSpec(t.id);
-  if (spec) return { period: 60 / spec.bpm, origin: 0, bpm: spec.bpm, live: false };
+  // morceau démo à tempo régulier : grille exacte (temps 0 = début du morceau)
+  const meta = getDemoMeta(t.id);
+  if (meta && meta.beatTimes?.length > 1) {
+    const bt = meta.beatTimes;
+    return { period: 60 / meta.realBpm, origin: bt[0], bpm: meta.realBpm, live: false, times: meta.tempoStable ? undefined : bt };
+  }
   const live = st.live;
   if (live && live.beatConfidence >= 0.35 && live.bpm > 0 && st.rate > 0) {
     const bpm = live.bpm / st.rate;
@@ -91,7 +110,13 @@ export function deckView(engine: Engine, id: DeckId, states?: Record<DeckId, Dec
   const pos = st.position;
   let beat = 0;
   let beatFrac = 0;
-  if (grid) {
+  if (grid?.times) {
+    const i = beatIndexAt(grid.times, pos);
+    const t0 = grid.times[Math.max(0, i)];
+    const t1 = grid.times[Math.min(grid.times.length - 1, Math.max(0, i) + 1)];
+    beat = i;
+    beatFrac = t1 > t0 ? Math.min(1, Math.max(0, (pos - t0) / (t1 - t0))) : 0;
+  } else if (grid) {
     const b = (pos - grid.origin) / grid.period;
     beat = Math.floor(b);
     beatFrac = b - beat;

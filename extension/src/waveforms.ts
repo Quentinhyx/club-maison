@@ -18,7 +18,8 @@ export interface Waveform {
   filled?: Uint8Array;    // pour le direct : points déjà mesurés
 }
 
-type ComputeFn = (b: AudioBuffer, pps: number) => { low: Float32Array; mid: Float32Array; high: Float32Array; peak: Float32Array };
+type WF = { low: Float32Array; mid: Float32Array; high: Float32Array; peak: Float32Array };
+type ComputeFn = (b: AudioBuffer, pps: number) => WF | Promise<WF>;
 
 const LIVE_PPS = 40;
 const FULL_PPS = 80;
@@ -46,7 +47,7 @@ export class WaveformStore {
     try {
       if (isDemoTrack(track.id)) {
         const buf = await getDemoBuffer(track.id, this.ctx);
-        const w = this.compute(buf, FULL_PPS);
+        const w = await this.compute(buf, FULL_PPS);
         this.byId.set(track.id, { trackId: track.id, pps: FULL_PPS, ...normalize(w), full: true });
       } else {
         const n = Math.max(1, Math.ceil((track.duration || 30) * LIVE_PPS) + 2);

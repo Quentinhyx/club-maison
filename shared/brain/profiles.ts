@@ -139,7 +139,7 @@ export const STYLE_PROFILES: Record<StyleProfileId, StyleProfile> = {
     playSeconds: playMap([60, 150], [30, 90], Object.fromEntries(HITS.map((g) => [g, [30, 90]]))),
     bridgePlayFactor: 1,
     playFullChance: 0,
-    bpmRange: [100, 128],
+    bpmRange: [118, 126], // tempo de soirée des morceaux électroniques (les tubes gardent leur tempo)
     bpmRampMinutes: 240,
     energyCurve: [[0, 0.55], [60, 0.7], [150, 0.85], [300, 0.8]],
     genreDwellMinutes: 4,

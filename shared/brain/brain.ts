@@ -544,7 +544,8 @@ class Brain implements DjBrain {
     const s = this.s;
     const cur = s.current;
     const analysis = pick.analysis;
-    const target = this.env.targetBpm;
+    // L'entrant se cale sur le sortant : on vérifie contre le tempo joué (ou le tempo de soirée à défaut).
+    const target = this.refBpm(input) ?? this.env.targetBpm;
     const check = checkReEdit(analysis, target, input.decks[deck].caps, input.settings, this.env.profile);
     if (!check.ok) {
       this.log(out, `Re-edit refusé pour ${trackName(pick.track)} : ${check.reason}`);
@@ -765,7 +766,7 @@ class Brain implements DjBrain {
     const harmony = !k1 || !k2 ? 'clé inconnue'
       : h >= 0.7 ? `clés compatibles (${k1} -> ${k2})` : `clés éloignées (${k1} -> ${k2}), on évite de les superposer longtemps`;
     const tech = describeTechnique(technique, beats);
-    const bridge = p.genre && this.s.target && p.genre !== this.s.target ? ` (pont vers ${label(this.s.target)})` : '';
+    const bridge = p.genre && this.s.target && p.genre !== this.s.target && this.s.path.includes(p.genre) ? ` (pont vers ${label(this.s.target)})` : '';
     const noGrid = g.reliable ? '' : ' ; grille de temps peu fiable, transition sans calage';
     const re = p.reEdit ? ` ; ${p.reEdit.text}` : '';
     const reason = `${head}${bridge} : ${tempo}, ${harmony}, ${tech} ; ${exitWhy}${noGrid}${re}`;

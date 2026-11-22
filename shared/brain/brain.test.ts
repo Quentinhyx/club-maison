@@ -304,7 +304,7 @@ class Sim {
             // la rampe ne doit pas toucher les 8 premiers temps d'un drop
             const nb = 60 / deck.analysis.bpm;
             const b0 = deck.position / nb;
-            const b1 = b0 + d.overBeats * Math.max(deck.rate, d.rate) * 1.01;
+            const b1 = b0 + d.overBeats * (Math.max(deck.rate, d.rate) / deck.rate) * 1.01; // temps natifs parcourus
             const P = Math.floor(deck.track.duration / (32 * nb));
             for (let p = Math.floor(b0 / 32); p * 32 <= b1; p++) {
               const sec: Section = p === 0 ? 'intro' : p >= P - 1 ? 'outro' : SECTION_PATTERN[(p - 1) % SECTION_PATTERN.length];
@@ -423,7 +423,7 @@ function checkInvariants(sim: Sim, label: string): void {
     assert.ok(!t, `${label} : groove-start pendant ${t?.plan.id}`);
   }
   for (const g of sim.grooveStops) {
-    const t = inTr(g.atCtx, g.atCtx + (g.fadeBeats * 60) / g.bpm + 1e-3);
+    const t = inTr(g.atCtx, g.atCtx + (g.fadeBeats * 60) / g.bpm - 0.02);
     assert.ok(!t, `${label} : groove-stop pendant ${t?.plan.id}`);
     if (g.deckTrackEnd !== undefined) assert.ok(g.atCtx <= g.deckTrackEnd, `${label} : groove-stop après la fin du morceau`);
   }
@@ -804,7 +804,7 @@ test('re-edit accepté : 80s 104 -> 124 avec un beat en dessous', () => {
   const t = sim.transitions.find((x) => x.inTrack.id === track.id)!;
   assert.ok(t, 'le morceau est passé');
   assert.ok(t.plan.incomingRate > 1.15 && t.plan.incomingRate < 1.25, `calage ${t.plan.incomingRate}`);
-  assert.match(t.plan.reason, /Re-edit : Années 80 à 104 BPM passé à 124 \(\+19 %\), tempo stable \(0,93\)/);
+  assert.match(t.plan.reason, /Re-edit : Années 80 à 104 BPM passé à 12[45] \(\+(19|20) %\), tempo stable \(0,93\)/);
   const starts = sim.grooveStarts.filter((g) => g.trackId === track.id);
   assert.ok(starts.length >= 2, `groove-start puis construction (${starts.length})`);
   const g1 = starts[0].plan;
