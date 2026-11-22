@@ -197,6 +197,12 @@ class Brain implements DjBrain {
     for (const d of Object.values(input.decks)) if (d.analysis) a.set(d.analysis.trackId, d.analysis);
     const extra = (input as BrainInput & BrainInputExtras).analyses;
     if (extra) for (const x of Array.isArray(extra) ? extra : Object.values(extra)) a.set(x.trackId, x);
+    // Les analyses arrivent souvent après le lancement ou le choix d'un morceau : on complète les
+    // références figées pour que tempo, tonalité et voix reflètent l'analyse la plus récente.
+    const s = this.s;
+    if (s.current && !s.current.analysis) s.current.analysis = a.get(s.current.track.id);
+    // (le morceau préparé est complété plus loin, là où le re-edit est réexaminé à l'arrivée de son analyse)
+    if (s.running && !s.running.incoming.analysis) s.running.incoming.analysis = a.get(s.running.incoming.track.id);
   }
 
   private makeEnv(input: BrainInput): TickEnv {
