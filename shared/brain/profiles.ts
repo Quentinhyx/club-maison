@@ -73,6 +73,8 @@ export interface StyleProfile {
   funnyDropChance: number;
   /** Le loop-roll est permis quand la grille n'est pas fiable (le roll masque l'imprécision). */
   rollWithoutGrid: boolean;
+  /** Sons d'ambiance (airhorn, siren, scratch) permis, avec parcimonie. */
+  stingers: boolean;
 }
 
 function playMap(electro: [number, number], other: [number, number], over: Partial<Record<Genre, [number, number]>> = {}): Record<Genre, [number, number]> {
@@ -124,6 +126,7 @@ export const STYLE_PROFILES: Record<StyleProfileId, StyleProfile> = {
     dropSwapChance: 0.45,
     funnyDropChance: 0.3,
     rollWithoutGrid: true,
+    stingers: true,
   },
   'paris-tech-house': {
     id: 'paris-tech-house',
@@ -167,6 +170,7 @@ export const STYLE_PROFILES: Record<StyleProfileId, StyleProfile> = {
     dropSwapChance: 0,
     funnyDropChance: 0,
     rollWithoutGrid: false,
+    stingers: false,
   },
   'open-format': {
     id: 'open-format',
@@ -210,6 +214,7 @@ export const STYLE_PROFILES: Record<StyleProfileId, StyleProfile> = {
     dropSwapChance: 0.15,
     funnyDropChance: 0.1,
     rollWithoutGrid: true,
+    stingers: false,
   },
   lounge: {
     id: 'lounge',
@@ -253,6 +258,7 @@ export const STYLE_PROFILES: Record<StyleProfileId, StyleProfile> = {
     dropSwapChance: 0,
     funnyDropChance: 0,
     rollWithoutGrid: false,
+    stingers: false,
   },
   'peak-time': {
     id: 'peak-time',
@@ -296,6 +302,7 @@ export const STYLE_PROFILES: Record<StyleProfileId, StyleProfile> = {
     dropSwapChance: 0.2,
     funnyDropChance: 0.1,
     rollWithoutGrid: true,
+    stingers: true,
   },
 };
 
@@ -307,6 +314,7 @@ export const DEFAULT_SETTINGS: DjSettings = {
   followCrowd: true,
   baseGenre: 'tech-house',
   allowReEdits: true,
+  stingers: true,
 };
 
 /** Énergie cible de la courbe de soirée à `minutes` depuis le début. */

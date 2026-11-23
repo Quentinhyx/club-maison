@@ -4,7 +4,11 @@
  */
 import assert from 'node:assert/strict';
 import type { Section, TrackRef } from '../contracts';
-import { analyzeBuffer, analyzePreview, getCachedAnalysis, LiveBeatTracker, normalizeBpm, toCamelot } from './index';
+import {
+  analyzeBuffer, analyzePreview, getCachedAnalysis, LiveBeatTracker, normalizeBpm, structureFromWaveform, toCamelot,
+  TrackScanner, waveformFromBuffer,
+} from './index';
+import { getDemoStructure, listDemoTracks, renderDemoPcm } from '../demo/index';
 
 const SR = 44100;
 let failures = 0;
@@ -152,6 +156,97 @@ function chords(seq: number[][], chordSeconds: number, seconds: number, sr = SR)
     }
   }
   return buf;
+}
+
+/** Compression temporelle ×rate qui préserve la hauteur (OLA à fenêtre de Hann), comme la pré-écoute. */
+function olaSpeedup(x: Float32Array, rate: number, N = 2048): Float32Array {
+  const Hs = N / 4, Ha = Math.round(Hs * rate);
+  const frames = Math.max(0, Math.floor((x.length - N) / Ha) + 1);
+  const out = new Float32Array(frames * Hs + N);
+  const w = new Float32Array(N);
+  for (let i = 0; i < N; i++) w[i] = 0.5 - 0.5 * Math.cos((2 * Math.PI * i) / N);
+  for (let m = 0; m < frames; m++) {
+    const a = m * Ha, o = m * Hs;
+    for (let i = 0; i < N; i++) out[o + i] += (x[a + i] * w[i]) / 2; // somme des Hann à N/4 = 2
+  }
+  return out;
+}
+
+/** Pousse un signal accéléré dans un scanner (trames de `frame`), positions en temps-morceau. */
+function scanAccelerated(sc: TrackScanner, fast: Float32Array, rate: number, sr: number, frame = 2048, keep?: (pos: number) => boolean): void {
+  for (let s = 0; s + frame <= fast.length; s += frame) {
+    // l'OLA place le centre d'un grain d'entrée (a + N/2) au centre du grain de sortie (o + N/2)
+    const p0 = ((s - 1024) * rate + 1024) / sr, p1 = ((s + frame - 1024) * rate + 1024) / sr;
+    if (p1 <= 0) continue;
+    if (keep && !keep(p0)) continue;
+    sc.push(fast.subarray(s, s + frame), p0, p1);
+  }
+}
+
+/** Morceau house synthétique : intro 32 temps / drop 64 / breakdown 32 (montée sur la fin) / drop 64 / outro 32. */
+function houseTrack(bpm: number, sr: number): { sig: Float32Array; drops: number[]; breakdown: [number, number]; outro: number } {
+  const P = 60 / bpm;
+  const parts = { intro: 32, drop1: 64, brk: 32, drop2: 64, outro: 32 };
+  const total = 32 + 64 + 32 + 64 + 32;
+  const seconds = total * P + 1;
+  const d1 = 32, b0 = 96, d2 = 128, o0 = 192;
+  const drums = drumLoop({
+    bpm, seconds, sr, hats: 'off', accent: 1,
+    kickOn: (b) => !(b >= b0 && b < d2) && b < total,
+    riser: (b) => (b >= b0 + 16 && b < d2 ? 0.015 * (b - b0 - 15) : 0),
+  });
+  const r = rng(99);
+  const len = drums.length;
+  const out = new Float32Array(len);
+  for (let i = 0; i < len; i++) {
+    const t = i / sr, beat = t / P;
+    let v = drums[i];
+    const inDrop = (beat >= d1 && beat < b0) || (beat >= d2 && beat < o0);
+    // basse en croches + clap + nappe en drop
+    if (inDrop) {
+      const ph = (beat * 2) % 1;
+      v += 0.35 * Math.exp(-ph * 4) * Math.sin(2 * Math.PI * 55 * t);
+      v += 0.08 * Math.sin(2 * Math.PI * 220 * t) + 0.06 * Math.sin(2 * Math.PI * 330 * t) + 0.05 * Math.sin(2 * Math.PI * 523 * t);
+      const bb = beat % 2;
+      if (bb >= 1 && bb < 1.15) v += 0.2 * r() * Math.exp(-(bb - 1) * 20);
+      v += 0.04 * r();
+    }
+    if (beat >= b0 && beat < d2) v += 0.07 * Math.sin(2 * Math.PI * 220 * t) + 0.05 * Math.sin(2 * Math.PI * 277 * t);
+    if (beat >= o0) v *= Math.max(0, 1 - 0.5 * (beat - o0) / parts.outro);
+    out[i] = v;
+  }
+  return { sig: out, drops: [d1 * P, d2 * P], breakdown: [b0 * P, d2 * P], outro: o0 * P };
+}
+
+/** Morceau pop : kick partout, couplets calmes, refrains forts (+ charleys, caisse claire, accords). */
+function popTrack(bpm: number, sr: number): { sig: Float32Array; choruses: number[] } {
+  const P = 60 / bpm;
+  const plan: Array<['intro' | 'verse' | 'chorus' | 'outro', number]> = [['intro', 16], ['verse', 32], ['chorus', 32], ['verse', 32], ['chorus', 32], ['outro', 16]];
+  const total = plan.reduce((a, p) => a + p[1], 0);
+  const seconds = total * P + 1;
+  const sectionAt = (b: number) => { let acc = 0; for (const [k, n] of plan) { if (b < acc + n) return k; acc += n; } return 'outro'; };
+  const out = new Float32Array(Math.round(seconds * sr));
+  const r = rng(5);
+  for (let b = 0; b < total; b++) {
+    const t = b * P, k = sectionAt(b);
+    const loud = k === 'chorus';
+    addKick(out, t, loud ? 0.9 : 0.55, sr);
+    if (loud) {
+      addNoiseBurst(out, t, 0.15, 0.012, r, true, sr);
+      addNoiseBurst(out, t + P / 2, 0.2, 0.012, r, true, sr);
+      if (b % 2 === 1) addNoiseBurst(out, t, 0.35, 0.05, r, false, sr);
+    } else if (k === 'verse' && b % 2 === 1) addNoiseBurst(out, t, 0.08, 0.03, r, false, sr);
+  }
+  const notes = [60, 64, 67];
+  for (let i = 0; i < out.length; i++) {
+    const t = i / sr, k = sectionAt(Math.floor(t / P));
+    const g = k === 'chorus' ? 0.07 : k === 'verse' ? 0.025 : 0.015;
+    for (const m of notes) out[i] += g * Math.sin(2 * Math.PI * NOTE(m) * t);
+  }
+  const choruses: number[] = [];
+  let acc = 0;
+  for (const [k, n] of plan) { if (k === 'chorus') choruses.push(acc * P); acc += n; }
+  return { sig: out, choruses };
 }
 
 const track = (id: number, extra: Partial<TrackRef> = {}): TrackRef => ({
@@ -423,6 +518,141 @@ async function main(): Promise<void> {
     results.push(`tempoStability direct : fixe ${fixed.toFixed(2)} ; dérive 100->104 ${drift.toFixed(2)} ; rubato ±6 % ${rub.toFixed(2)}`);
     assert.ok(fixed > 0.9, `fixe ${fixed}`);
     assert.ok(rub < 0.3, `rubato ${rub}`);
+  });
+
+
+  // ------------------------------------------------------------------------------------------
+  // Scan accéléré (pré-écoute ×4) : forme d'onde + structure
+  // ------------------------------------------------------------------------------------------
+
+  const near = (xs: number[], x: number, tol: number) => xs.some((v) => Math.abs(v - x) <= tol);
+
+  await test('waveformFromBuffer : 3 bandes + crête, 0..1, coverage 1', () => {
+    const sig = drumLoop({ bpm: 124, seconds: 10, hats: 'eighths' });
+    const w = waveformFromBuffer({ left: sig, sampleRate: SR }, 42);
+    assert.equal(w.trackId, 42);
+    assert.equal(w.pointsPerSecond, 50);
+    assert.equal(w.low.length, 500);
+    assert.equal(w.coverage, 1);
+    for (const a of [w.low, w.mid, w.high, w.peak]) {
+      let mx = 0;
+      for (const v of a) { assert.ok(v >= 0 && v <= 1); mx = Math.max(mx, v); }
+      assert.ok(Math.abs(mx - 1) < 1e-6);
+    }
+    const w2 = waveformFromBuffer({ left: sig, right: sig, sampleRate: SR }, 42, 20);
+    assert.equal(w2.low.length, 200);
+  });
+
+  const BPM_H = 124, PH = 60 / BPM_H;
+  const house = houseTrack(BPM_H, SR);
+  const houseDur = house.sig.length / SR;
+  const houseFast = olaSpeedup(house.sig, 4);
+
+  for (const hint of [undefined, 124] as const) {
+    await test(`TrackScanner : house 124 scanné à ×4 ${hint ? 'avec' : 'sans'} a priori -> drops au temps près, breakdown, outro`, () => {
+      const sc = new TrackScanner({ sampleRate: SR, duration: houseDur });
+      const t0 = performance.now();
+      scanAccelerated(sc, houseFast, 4, SR);
+      const st = sc.getStructure(hint);
+      const ms = performance.now() - t0;
+      assert.ok(sc.coverage() > 0.99, `coverage ${sc.coverage()}`);
+      assert.ok(st, 'pas de structure');
+      const secs = st.sections.map((x) => `${x.section}@${x.startPos.toFixed(1)}`).join(' ');
+      results.push(`scan ×4 house 124 (${hint ? 'a priori' : 'sans a priori'}) : ${st.bpm} BPM, drops ${st.dropPositions.map((d) => d.toFixed(2)).join(', ')} (vrais ${house.drops.map((d) => d.toFixed(2)).join(', ')}), outro ${st.outroPos?.toFixed(2)} (vrai ${house.outro.toFixed(2)}), confiance ${st.confidence.toFixed(2)}, ${ms.toFixed(0)} ms ; ${secs}`);
+      assert.ok(Math.abs(st.bpm - BPM_H) < 0.3, `bpm ${st.bpm}`);
+      for (const d of house.drops) assert.ok(near(st.dropPositions, d, PH * 0.99), `drop ${d.toFixed(2)} manqué : ${st.dropPositions}`);
+      assert.ok(near(house.drops, st.dropPositions[0], PH * 0.99), `drop principal ${st.dropPositions[0]}`);
+      const bk = st.sections.find((x) => x.section === 'breakdown');
+      assert.ok(bk && Math.abs(bk.startPos - house.breakdown[0]) < 4 * PH, `breakdown : ${secs}`);
+      assert.ok(st.outroPos !== undefined && Math.abs(st.outroPos - house.outro) <= 4 * PH, `outro ${st.outroPos}`);
+      // grille : premier temps de mesure calé sur la vraie grille (temps 0 = premier temps)
+      const bar = 4 * PH;
+      const ph = ((st.firstDownbeatPos % bar) + bar) % bar;
+      assert.ok(Math.min(ph, bar - ph) < 0.03, `premier temps ${st.firstDownbeatPos}`);
+      assert.equal(st.phraseBeats, 32);
+      assert.ok(st.confidence > 0.5, `confiance ${st.confidence}`);
+      const w = sc.getWaveform(7);
+      assert.equal(w.coverage, sc.coverage());
+      assert.equal(w.low.length, Math.ceil(houseDur * 50));
+    });
+  }
+
+  await test('TrackScanner : scan partiel (moitié), trous et recouvrements -> pas d\'exception', () => {
+    const half = new TrackScanner({ sampleRate: SR, duration: houseDur });
+    scanAccelerated(half, houseFast, 4, SR, 2048, (p) => p < houseDur / 2);
+    assert.ok(Math.abs(half.coverage() - 0.5) < 0.03, `coverage ${half.coverage()}`);
+    const st = half.getStructure(124);
+    const w = half.getWaveform(1);
+    assert.ok(Math.abs(w.coverage - 0.5) < 0.03);
+    assert.equal(w.low[w.low.length - 10], 0);
+    if (st) assert.ok(near(st.dropPositions, house.drops[0], PH), `drop 1 en scan partiel : ${st.dropPositions}`);
+    // trous (10 s sur 20) + recouvrements (une trame sur 5 repoussée) + trame à l'envers / hors morceau
+    const holes = new TrackScanner({ sampleRate: SR, duration: houseDur });
+    const frame = 2048;
+    for (let s = 0; s + frame <= houseFast.length; s += frame) {
+      const p0 = ((s - 1024) * 4 + 1024) / SR, p1 = ((s + frame - 1024) * 4 + 1024) / SR;
+      if (p1 <= 0 || Math.floor(p0 / 10) % 2 === 1) continue;
+      holes.push(houseFast.subarray(s, s + frame), p0, p1);
+      if ((s / frame) % 5 === 0) holes.push(houseFast.subarray(s, s + frame), p0, p1);
+    }
+    holes.push(new Float32Array(16), 50, 40);
+    holes.push(new Float32Array(16), 9999, 10000);
+    holes.push(new Float32Array(0), 1, 2);
+    assert.ok(holes.coverage() > 0.4 && holes.coverage() < 0.6, `coverage ${holes.coverage()}`);
+    const sh = holes.getStructure(124);
+    results.push(`scan partiel : coverage ${half.coverage().toFixed(3)}, structure ${st ? 'oui' : 'non'} ; à trous : coverage ${holes.coverage().toFixed(3)}, ${sh ? `${sh.bpm} BPM, drops ${sh.dropPositions.map((d) => d.toFixed(1)).join(', ')}` : 'pas de structure'}`);
+    if (sh) assert.ok(Math.abs(sh.bpm - 124) < 0.5);
+    const empty = new TrackScanner({ sampleRate: SR, duration: 200 });
+    assert.equal(empty.coverage(), 0);
+    assert.equal(empty.getStructure(), undefined);
+    assert.equal(empty.getWaveform(3).coverage, 0);
+  });
+
+  await test('structureFromWaveform : morceau pop (couplet calme / refrain fort) -> premier refrain dans les drops', () => {
+    const pop = popTrack(100, SR);
+    const w = waveformFromBuffer({ left: pop.sig, sampleRate: SR }, 5);
+    const st = structureFromWaveform(w);
+    assert.ok(st);
+    const P = 0.6;
+    results.push(`pop 100 : ${st.bpm} BPM, drops ${st.dropPositions.map((d) => d.toFixed(2)).join(', ')} (refrains ${pop.choruses.map((d) => d.toFixed(1)).join(', ')}) ; ${st.sections.map((x) => `${x.section}@${x.startPos.toFixed(1)}`).join(' ')}`);
+    assert.ok(Math.abs(st.bpm - 100) < 0.5, `bpm ${st.bpm}`);
+    assert.ok(near(st.dropPositions, pop.choruses[0], P * 0.99), `premier refrain ${pop.choruses[0]} absent : ${st.dropPositions}`);
+    assert.ok(near(st.dropPositions, pop.choruses[1], P * 0.99), `second refrain absent : ${st.dropPositions}`);
+    // structureFromWaveform sur la forme d'onde d'un scan accéléré = getStructure
+    const sc = new TrackScanner({ sampleRate: SR, duration: pop.sig.length / SR });
+    scanAccelerated(sc, olaSpeedup(pop.sig, 4), 4, SR);
+    const a = sc.getStructure(), b = structureFromWaveform(sc.getWaveform(5));
+    assert.deepEqual(a?.dropPositions, b?.dropPositions);
+  });
+
+  await test('morceaux démo (shared/demo) : drop principal au temps près, outro', () => {
+    const DSR = 22050;
+    const ids = [-1009, -1017, -1014];
+    const tracks = listDemoTracks();
+    for (const id of ids) {
+      const t = tracks.find((x) => x.id === id)!;
+      const pcm = renderDemoPcm(id, DSR);
+      const truth = getDemoStructure(id);
+      // -1017 passe par une vraie pré-écoute simulée (×4, OLA) ; les autres par le tampon complet
+      let st;
+      if (id === -1017) {
+        const mono = new Float32Array(pcm.left.length);
+        for (let i = 0; i < mono.length; i++) mono[i] = 0.5 * (pcm.left[i] + pcm.right[i]);
+        const sc = new TrackScanner({ sampleRate: DSR, duration: mono.length / DSR, bpmHint: t.bpm });
+        scanAccelerated(sc, olaSpeedup(mono, 4), 4, DSR);
+        st = sc.getStructure();
+      } else {
+        st = structureFromWaveform(waveformFromBuffer({ left: pcm.left, right: pcm.right, sampleRate: DSR }, id), t.bpm);
+      }
+      assert.ok(st, `${id} : pas de structure`);
+      const P = 60 / st.bpm;
+      const trueDrops = truth.filter((x, i) => x.section === 'drop' && i > 0 && truth[i - 1].section !== 'drop').map((x) => x.startSec);
+      const outro = truth.find((x) => x.section === 'outro')!.startSec;
+      results.push(`démo ${id} (${t.title}) : drops ${st.dropPositions.map((d) => d.toFixed(1)).join(', ')} / vrais ${trueDrops.map((d) => d.toFixed(1)).join(', ')} ; outro ${st.outroPos?.toFixed(1)} / ${outro.toFixed(1)}`);
+      assert.ok(Math.abs(st.bpm - (t.bpm ?? 0)) < 0.5, `${id} bpm ${st.bpm}`);
+      assert.ok(near(trueDrops, st.dropPositions[0], P * 0.99), `${id} : drop principal ${st.dropPositions[0]} hors des vrais drops ${trueDrops}`);
+      assert.ok(st.outroPos !== undefined && Math.abs(st.outroPos - outro) <= 8 * P, `${id} outro ${st.outroPos} vs ${outro}`);
+    }
   });
 
   await test('LiveBeatTracker : reset + outro avec durée connue', () => {

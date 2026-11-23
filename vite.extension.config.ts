@@ -61,7 +61,9 @@ function extensionAssets(): Plugin {
       this.emitFile({ type: 'asset', fileName: 'manifest.json', source: readFileSync(resolve(root, 'manifest.json'), 'utf8') });
       for (const s of [16, 48, 128]) this.emitFile({ type: 'asset', fileName: `icons/icon${s}.png`, source: icon(s) });
       this.emitFile({ type: 'asset', fileName: 'worklets/live-capture.js', source: LIVE_WORKLET_SRC });
-      this.emitFile({ type: 'asset', fileName: 'worklets/loop.js', source: LOOP_WORKLET_SRC });
+      // même contournement que loopWorkletFix pour la source importée par cette config
+      const loopSrc = /\bclass LoopCore\b/.test(LOOP_WORKLET_SRC) ? LOOP_WORKLET_SRC : LOOP_WORKLET_SRC.replace(/^class \{/m, 'var LoopCore = class {');
+      this.emitFile({ type: 'asset', fileName: 'worklets/loop.js', source: loopSrc });
     },
     async closeBundle() {
       // un build par script de contenu : format IIFE, tout en un seul fichier
@@ -82,10 +84,29 @@ function extensionAssets(): Plugin {
   };
 }
 
+/**
+ * Contournement : shared/audio/loop.ts sérialise la classe LoopCore avec `${LoopCore.toString()}`, mais
+ * un bundler transforme `class LoopCore {}` en `var LoopCore = class {}` : la source du worklet devient
+ * `class { … }` (anonyme, invalide) et l'échantillonneur retombe sur le ScriptProcessor. On rend la
+ * source robuste au moment du build (sans modifier le fichier) : `var LoopCore = <classe>;`.
+ */
+function loopWorkletFix(): Plugin {
+  return {
+    name: 'club-maison-loop-worklet-fix',
+    enforce: 'pre',
+    transform(code, id) {
+      if (!/shared[\\/]audio[\\/]loop\.ts$/.test(id)) return null;
+      const needle = '${LoopCore.toString()}';
+      if (!code.includes(needle)) return null;
+      return { code: code.replace(needle, 'var LoopCore = ${LoopCore.toString()};'), map: null };
+    },
+  };
+}
+
 export default defineConfig({
   root,
   base: './',
-  plugins: [react(), extensionAssets()],
+  plugins: [loopWorkletFix(), react(), extensionAssets()],
   build: {
     outDir,
     emptyOutDir: true,

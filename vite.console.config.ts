@@ -51,16 +51,38 @@ function deezerProxy(): Plugin {
   };
 }
 
+/**
+ * Contournement : shared/audio/loop.ts sérialise la classe LoopCore avec `${LoopCore.toString()}`, mais
+ * un bundler transforme `class LoopCore {}` en `var LoopCore = class {}` : la source du worklet devient
+ * `class { … }` (anonyme, invalide) et l'échantillonneur retombe sur le ScriptProcessor. On rend la
+ * source robuste au moment du build (sans modifier le fichier) : `var LoopCore = <classe>;`.
+ */
+function loopWorkletFix(): Plugin {
+  return {
+    name: 'club-maison-loop-worklet-fix',
+    enforce: 'pre',
+    transform(code, id) {
+      if (!/shared[\\/]audio[\\/]loop\.ts$/.test(id)) return null;
+      const needle = '${LoopCore.toString()}';
+      if (!code.includes(needle)) return null;
+      return { code: code.replace(needle, 'var LoopCore = ${LoopCore.toString()};'), map: null };
+    },
+  };
+}
+
 export default defineConfig({
   root: resolve(import.meta.dirname, 'extension'),
   // en ligne, la console est servie sous /console/ (vercel.json) ; en localhost, à la racine
   base: process.env.CONSOLE_BASE ?? (process.env.VERCEL ? '/console/' : '/'),
-  plugins: [react(), deezerProxy()],
+  plugins: [loopWorkletFix(), react(), deezerProxy()],
   server: { port: 5190, strictPort: false, open: false },
   preview: { port: 5190 },
   build: {
     outDir: resolve(import.meta.dirname, 'dist/console'),
     emptyOutDir: true,
+    // pas de minification : shared/audio sérialise des classes (LoopCore.toString()) dans la source
+    // de son AudioWorklet, leurs noms doivent rester intacts
+    minify: false,
     rollupOptions: { input: { console: resolve(import.meta.dirname, 'extension/console.html') } },
   },
 });

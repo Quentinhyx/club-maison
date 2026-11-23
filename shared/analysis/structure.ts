@@ -359,7 +359,10 @@ function computeStructure(w: TrackWaveform, mask: Uint8Array, bpmHint: number): 
     const L0 = Math.max(0, i - W), R1 = Math.min(nb, i + W);
     const dl = median(Array.from(lr.slice(i, R1))) - median(Array.from(lr.slice(L0, i)));
     const dv = median(Array.from(vv.slice(i, R1))) - median(Array.from(vv.slice(L0, i)));
-    novB[i] = Math.abs(dl) + 1.5 * Math.abs(dv);
+    // les médianes donnent un plateau de ±1 mesure autour d'un échelon : la moyenne (pic net) départage
+    const ml = avg(Array.from(lr.slice(i, R1))) - avg(Array.from(lr.slice(L0, i)));
+    const mv = avg(Array.from(vv.slice(i, R1))) - avg(Array.from(vv.slice(L0, i)));
+    novB[i] = Math.abs(dl) + 1.5 * Math.abs(dv) + 0.3 * (Math.abs(ml) + 1.5 * Math.abs(mv));
   }
   const cand: number[] = [];
   for (let i = 2; i <= nb - 2; i++) {
@@ -382,21 +385,41 @@ function computeStructure(w: TrackWaveform, mask: Uint8Array, bpmHint: number): 
   }
 
   // ---- noms de sections
-  const kickSegs = segs.filter((g) => g.kick);
-  const vMax = kickSegs.length ? Math.max(...kickSegs.map((g) => g.v)) : 0;
-  const isHi = (g: Seg) => g.kick && g.v >= vMax - 0.1;
+  // niveau d'un segment avec kick : médiums + aigus, plus la basse (la basse qui s'ajoute au kick compte)
+  const level = (g: Seg) => g.v + 0.5 * Math.min(1, g.lr);
+  // niveau « principal » : quantile 75 % des mesures avec kick (robuste aux breaks et segments courts)
+  const levKick: number[] = [];
+  for (let i = 0; i < nb; i++) if (lr[i] >= 0.4) levKick.push(vv[i] + 0.5 * Math.min(1, lr[i]));
+  const vMax = percentile(levKick, 0.75);
+  const isHi = (g: Seg) => g.kick && level(g) >= vMax - 0.1;
   let seenMain = false;
   for (let i = 0; i < segs.length; i++) {
     const g = segs[i], prev = segs[i - 1];
     const isFirst = i === 0, isLast = i === segs.length - 1;
     if (!g.kick) g.section = isFirst ? 'intro' : isLast && seenMain ? 'outro' : isLast ? 'outro' : 'breakdown';
     else if (prev && !prev.kick) g.section = 'drop';
-    else if (isHi(g) && prev && prev.kick && g.v - prev.v >= 0.1) g.section = 'drop';
+    else if (isHi(g) && prev && prev.kick && level(g) - level(prev) >= 0.1) g.section = 'drop';
     else if (!isHi(g) && isFirst && segs.length > 1) g.section = 'intro';
     else if (!isHi(g) && isLast && seenMain) g.section = 'outro';
     else g.section = 'body';
     if (g.kick && (g.section === 'drop' || g.section === 'body')) seenMain = true;
   }
+  // intro / outro : toute la suite de segments calmes (sans kick ou en dessous du niveau principal)
+  // avant le premier / après le dernier segment principal
+  const calm = (g: Seg) => !g.kick || !isHi(g);
+  const firstMain = segs.findIndex((g) => !calm(g));
+  // (intro : seulement les segments sans kick du début, plus le premier s'il est calme ; un couplet
+  // calme avant le premier refrain reste un « body »)
+  if (firstMain > 0) {
+    for (let i = 0; i < firstMain; i++) {
+      if (segs[i].section === 'drop') break;
+      if (i === 0 || !segs[i].kick) segs[i].section = 'intro';
+      else break;
+    }
+  }
+  let lastMain = -1;
+  for (let i = segs.length - 1; i >= 0; i--) if (!calm(segs[i])) { lastMain = i; break; }
+  if (lastMain >= 0) for (let i = lastMain + 1; i < segs.length; i++) segs[i].section = 'outro';
   // montée : fin d'un breakdown où médiums + aigus montent nettement -> build
   const withBuild: Seg[] = [];
   for (const g of segs) {
@@ -420,29 +443,29 @@ function computeStructure(w: TrackWaveform, mask: Uint8Array, bpmHint: number): 
   segs = segs.reduce<Seg[]>((acc, g) => {
     const last = acc[acc.length - 1];
     if (last && last.section === g.section && g.section !== 'drop') last.z = g.z;
-    else if (last && last.section === 'drop' && g.section === 'drop' && !(g.v - last.v >= 0.1)) last.z = g.z;
+    else if (last && last.section === 'drop' && g.section === 'drop' && !(level(g) - level(last) >= 0.1)) last.z = g.z;
     else acc.push({ ...g });
     return acc;
   }, []);
   const segE = (g: Seg) => avg(bars.slice(g.a, g.z + 1).filter((b) => b.covered).map((b) => b.energy));
 
   // ---- drops : retour net des basses + énergie, au temps près
-  // recalage d'un début de drop au temps près : contraste « après - avant » (énergie +
-  // basse, médianes), maximal, parmi les premiers temps de mesure à ±2 mesures
+  // recalage d'un début de drop au temps près : retour du kick après un breakdown : contraste « 4 temps
+  // après - 4 temps avant » (énergie + basse), maximal, parmi les premiers temps de mesure à ±2 mesures
   const lowP90 = percentile(Array.from(beatLow), 0.9) || 1;
   const eP90 = percentile(Array.from(beatE), 0.9) || 1;
-  const refine = (barStart: number): number => {
+  const refine = (barStart: number, sign = 1): number => {
     const k0 = Math.round((barStart - firstBeat) / beatSec);
     let best = k0, bestSc = -Infinity;
-    for (let k = Math.max(1, k0 - 8); k <= Math.min(nBeats - 1, k0 + 8); k++) {
+    for (let k = Math.max(4, k0 - 8); k <= Math.min(nBeats - 4, k0 + 8); k++) {
       if ((((k - down) % 4) + 4) % 4 !== 0) continue; // un drop tombe sur un premier temps
-      // médianes : 16 temps avant (un break d'une mesure ne pèse pas), 8 temps après
-      const before: number[] = [], after: number[] = [], lBefore: number[] = [], lAfter: number[] = [];
-      for (let j = Math.max(0, k - 16); j < k; j++) if (beatCov[j]) { before.push(beatE[j]); lBefore.push(beatLow[j]); }
-      for (let j = k; j < Math.min(nBeats, k + 8); j++) if (beatCov[j]) { after.push(beatE[j]); lAfter.push(beatLow[j]); }
-      if (before.length < 2 || after.length < 2) continue;
-      let sc = (median(after) - median(before)) / eP90 + (median(lAfter) - median(lBefore)) / lowP90;
-      sc -= 0.01 * Math.abs(k - k0);
+      let ea = 0, eb = 0, la = 0, lb = 0, ok = true;
+      for (let j = 0; j < 4; j++) {
+        if (!beatCov[k - 1 - j] || !beatCov[k + j]) ok = false;
+        ea += beatE[k - 1 - j]; eb += beatE[k + j]; la += beatLow[k - 1 - j]; lb += beatLow[k + j];
+      }
+      if (!ok) continue;
+      const sc = sign * ((0.5 * (eb - ea)) / (4 * eP90) + (1.5 * (lb - la)) / (4 * lowP90)) - 0.01 * Math.abs(k - k0);
       if (sc > bestSc) { bestSc = sc; best = k; }
     }
     return firstBeat + best * beatSec;
@@ -459,7 +482,10 @@ function computeStructure(w: TrackWaveform, mask: Uint8Array, bpmHint: number): 
     const dL = avg(after.map((b) => b.low)) - avg(before.map((b) => b.low));
     const score = Math.max(0, dE) / eRef + 0.7 * Math.max(0, dL) / lowRef
       + (prev.section === 'breakdown' || prev.section === 'build' ? 0.3 : 0);
-    drops.push({ pos: refine(bars[s.a].start), score, order: i });
+    // retour du kick : recalé au temps près ; refrain (le kick était déjà là) : la frontière de mesure
+    // trouvée par la nouveauté est plus fiable (les breaks de fin de couplet trompent un recalage local)
+    const pos = prev.kick ? bars[s.a].start : refine(bars[s.a].start);
+    drops.push({ pos, score, order: i });
   });
   drops.sort((a, b) => (Math.abs(a.score - b.score) < 0.1 * Math.max(a.score, b.score) ? a.order - b.order : b.score - a.score));
 
@@ -485,7 +511,17 @@ function computeStructure(w: TrackWaveform, mask: Uint8Array, bpmHint: number): 
     endPos: i === segs.length - 1 ? n / fps : bars[s.z].start + barSec,
     energy: clamp01(segE(s) / eRef),
   }));
+  // les sections « drop » commencent au temps recalé
+  for (const d of drops) {
+    const cur = sections[d.order], prev = sections[d.order - 1];
+    if (prev && d.pos > prev.startPos && d.pos < cur.endPos) { cur.startPos = d.pos; prev.endPos = d.pos; }
+  }
   const outro = segs.findIndex((s) => s.section === 'outro');
+  // début d'outro recalé sur le premier temps où l'énergie et la basse baissent le plus (±2 mesures)
+  if (outro > 0) {
+    const p = refine(sections[outro].startPos, -1);
+    if (p > sections[outro - 1].startPos && p < sections[outro].endPos) { sections[outro].startPos = p; sections[outro - 1].endPos = p; }
+  }
   const covFrac = nCov / n;
   const contrast = clamp01(1 - (percentile(cov.map((b) => b.low), 0.1) / lowRef));
   const confidence = clamp01(

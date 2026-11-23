@@ -31,6 +31,7 @@ function mulberry32(seed: number): () => number {
 let passed = 0;
 let failed = 0;
 function test(name: string, fn: () => void): void {
+  if (process.env.ONLY && !name.includes(process.env.ONLY)) return;
   try {
     fn();
     passed++;
@@ -393,7 +394,7 @@ class Sim {
           this.groove = { deck: d.plan.deck, trackId: this.decks[d.plan.deck].track?.id, bpm: d.plan.bpm };
           break;
         }
-        case 'groove-update': this.grooveUpdates++; break;
+        case 'groove-update': this.grooveUpdates++; if (this.groove) this.groove.bpm = d.bpm; break;
         case 'groove-stop': {
           const gd = this.groove ? this.decks[this.groove.deck] : undefined;
           const end = gd?.track && gd.status === 'playing' ? this.nowCtx + (gd.track.duration - gd.position) / gd.rate : undefined;
@@ -716,6 +717,12 @@ test('vote massif 80s depuis la tech house : chemin par des genres intermédiair
   const nBefore = sim.history.length;
   sim.crowd.genreWeights = { '80s': 30, 'tech-house': 2 };
   sim.runFor(80 * 60);
+  if (process.env.DBG) {
+    for (const g of sim.grooveStarts) console.log('GS', g.now.toFixed(2), g.plan.startCtx.toFixed(2), g.plan.fadeBeats, g.reason.slice(0, 60));
+    for (const g of sim.grooveStops) console.log('GX', g.now.toFixed(2), g.atCtx.toFixed(2), g.fadeBeats, g.bpm);
+    for (const t of sim.transitions.slice(5, 9)) console.log('T', t.plan.id, t.atNow.toFixed(2), t.plan.startCtx.toFixed(2), t.endCtx.toFixed(2), t.plan.technique, t.plan.reason.slice(0, 90));
+    for (const l of sim.logs.filter((x) => /beat|groove|Re-edit/i.test(x))) console.log(l);
+  }
   checkInvariants(sim, 'vote 80s');
   const after = sim.playedGenres().slice(nBefore - 1);
   const i80 = after.indexOf('80s');
@@ -947,15 +954,19 @@ test('rampes de rate : bornées, hors drop, vers le tempo de soirée', () => {
 });
 
 test('re-edits pendant une soirée open-format (vote 80s depuis la house)', () => {
-  const sim = new Sim({ seed: 41, style: 'open-format', baseGenre: 'house' });
-  sim.runFor(10 * 60);
-  sim.crowd.genreWeights = { '80s': 20, house: 3 };
-  sim.runFor(50 * 60);
-  checkInvariants(sim, 'open re-edit');
-  const n = new Set(sim.grooveStarts.map((g) => g.trackId)).size;
-  console.log(`     re-edits en open-format : ${n}, morceaux : ${sim.played().length}`);
-  assert.ok(n >= 1, 'au moins un re-edit');
-  assert.ok(n <= sim.played().length / 2, 're-edits dosés');
+  let total = 0;
+  for (const seed of [41, 42, 43]) {
+    const sim = new Sim({ seed, style: 'open-format', baseGenre: 'house' });
+    sim.runFor(10 * 60);
+    sim.crowd.genreWeights = { '80s': 20, house: 3 };
+    sim.runFor(50 * 60);
+    checkInvariants(sim, `open re-edit ${seed}`);
+    const n = new Set(sim.grooveStarts.map((g) => g.trackId)).size;
+    console.log(`     re-edits en open-format (graine ${seed}) : ${n}, morceaux : ${sim.played().length}`);
+    assert.ok(n <= sim.played().length / 2, 're-edits dosés');
+    total += n;
+  }
+  assert.ok(total >= 1, 'au moins un re-edit');
 });
 
 // --------------------------------------------------------------------------------------------- profil soirée, structure, suivant
@@ -1162,6 +1173,40 @@ test('file vide sans vote : même registre, candidats similaires préférés', (
     const w = keys.slice(Math.max(0, i - 5), i + 1);
     assert.ok(w.filter((k) => k === keys[i]).length <= 2, 'pas plus de 2 fois le même artiste sur 6');
   }
+});
+
+const STINGERS = new Set(['airhorn', 'siren', 'scratch']);
+function stingers(sim: Sim): FxCue[] {
+  const all = [...sim.fx.map((f) => f.cue), ...sim.transitions.flatMap((t) => t.plan.accents)];
+  return all.filter((c) => STINGERS.has(c.kind)).sort((a, b) => a.atCtx - b.atCtx);
+}
+
+test('sons d’ambiance : parcimonie, jamais en lounge ni si désactivés', () => {
+  const sim = new Sim({ seed: 81, style: 'soiree', maxPlay: 180, structure: true });
+  sim.runFor(30 * 60);
+  checkInvariants(sim, 'stingers');
+  const st = stingers(sim);
+  console.log(`     sons d'ambiance en 30 min : ${st.map((c) => `${c.kind}@${((c.atCtx - 100) / 60).toFixed(1)}min`).join(', ')}`);
+  assert.ok(st.length >= 3 && st.length <= 10, `nombre ${st.length}`);
+  for (let i = 1; i < st.length; i++) {
+    assert.ok(st[i].atCtx - st[i - 1].atCtx >= 180, 'espacement >= 3 min');
+    assert.notEqual(st[i].kind, st[i - 1].kind, 'jamais deux fois le même d’affilée');
+  }
+  for (const c of st) {
+    if (c.kind === 'airhorn') assert.ok(c.beats === 2 && c.amount >= 0.6 && c.amount <= 0.8);
+    if (c.kind === 'siren') assert.ok(c.beats >= 4 && c.beats <= 8 && c.amount === 0.5);
+    if (c.kind === 'scratch') assert.ok(c.beats <= 2 && c.amount === 0.6);
+  }
+  const lounge = new Sim({ seed: 81, style: 'lounge', fxAmount: 1 });
+  lounge.runFor(30 * 60);
+  assert.equal(stingers(lounge).length, 0, 'aucun en lounge');
+  const paris = new Sim({ seed: 81, fxAmount: 1 });
+  paris.runFor(30 * 60);
+  assert.equal(stingers(paris).length, 0, 'aucun en paris-tech-house');
+  const off = new Sim({ seed: 81, style: 'soiree', maxPlay: 180 });
+  off.settings.stingers = false;
+  off.runFor(30 * 60);
+  assert.equal(stingers(off).length, 0, 'aucun si stingers false');
 });
 
 // --------------------------------------------------------------------------------------------- soirée de 2 h

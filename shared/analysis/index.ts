@@ -6,3 +6,5 @@ export type { LiveBeatTrackerOptions } from './live';
 export { LiveAnalyzer } from './liveAnalyzer';
 export type { LiveAnalyzerOptions } from './liveAnalyzer';
 export { normalizeBpm, toCamelot } from './dsp';
+export { TrackScanner, waveformFromBuffer, structureFromWaveform } from './structure';
+export type { TrackScannerOptions } from './structure';

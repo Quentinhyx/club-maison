@@ -35,6 +35,8 @@ export const GUEST_FIT_SCORE = 0.55;
 const WANT_GENRE_COOLDOWN_MS = 20_000;
 /** La platine Deezer doit avoir le temps de charger : 'load' au moins 20 s avant la transition. */
 export const MIN_LOAD_LEAD_S = 20;
+/** Au plus un son d'ambiance toutes les ~4 minutes. */
+export const STINGER_GAP_S = 240;
 const MIN_CANDIDATES = 3;
 /** Inertie des votes : part minimale du genre en tête, et avance sur le genre visé actuel. */
 const VOTE_SHARE_MIN = 0.4;
@@ -106,6 +108,9 @@ interface State {
   skips: SkipMark[];
   bannedArtists: Map<string, number>;
   avoidGenre?: { genre: Genre; untilMs: number };
+  /** Sons d'ambiance : dernier placé (budget ~4 min, jamais deux fois le même d'affilée). */
+  lastStingerCtx: number;
+  lastStingerKind?: FxKind;
   /** 'stop' différé : l'entrant n'est pas encore parti (la table boucle le sortant). */
   pendingStop?: DeckId;
   tracksSinceReEdit: number;
@@ -288,7 +293,7 @@ function initialState(): State {
     targetSince: 0, path: [], lastEvalS: -Infinity, lastFxCtx: -Infinity,
     analyses: new Map(), analyzeAsked: new Set(), wantAsked: new Map(), plays: new Map(),
     artists: [], badIds: new Set(), logged: new Set(), planCounter: 0,
-    lastRatePhrase: -Infinity, tracksSinceReEdit: Infinity, reEditCount: 0, skips: [], bannedArtists: new Map(),
+    lastRatePhrase: -Infinity, lastStingerCtx: -Infinity, tracksSinceReEdit: Infinity, reEditCount: 0, skips: [], bannedArtists: new Map(),
   };
 }
 
@@ -296,6 +301,7 @@ class Brain implements DjBrain {
   private s: State = initialState();
   private random: () => number;
   private env!: TickEnv;
+  private lastNow = 0;
 
   constructor(random: () => number) { this.random = random; }
 
@@ -304,6 +310,7 @@ class Brain implements DjBrain {
   tick(input: BrainInput): BrainDecision[] {
     const s = this.s;
     const out: BrainDecision[] = [];
+    this.lastNow = input.nowCtx;
     if (s.partyStartMs === undefined) { s.partyStartMs = input.nowMs; s.targetSince = input.nowMs; }
     this.ingest(input);
     this.env = this.makeEnv(input);
@@ -1145,6 +1152,8 @@ class Brain implements DjBrain {
       : clamp(settings.fxAmount * (0.5 + profile.fxDensity) + (genreChange ? 0.15 : 0) + (peak ? 0.1 : 0), 0, profile.maxIntensity);
     intensity = Math.round(intensity * 100) / 100;
     const accents = this.accents(technique, cur, startCtx, beats, beatLen, outBpm, incomingStartCtx, intensity, genreChange, peak);
+    const sting = this.transitionStinger(input, technique, cur, inAna, incomingStartCtx, beatLen, outBpm, beats);
+    if (sting) accents.push(sting);
     let funny = false;
     if (technique === 'loop-roll') {
       // Vraie boucle (échantillonneur de la table) : un temps du sortant qui raccourcit jusqu'à 1/8.
@@ -1308,7 +1317,7 @@ class Brain implements DjBrain {
     }
     const lead = Math.floor((plan.startCtx - now) / beatLen - 0.25);
     const fade = clamp(lead, 0, 8);
-    this.stopGroove(plan.startCtx - fade * beatLen, fade, out, `Fin du re-edit : le beat s’efface sur ${fade} temps avant la transition`);
+    this.stopGroove(plan.startCtx - (fade + 0.25) * beatLen, fade, out, `Fin du re-edit : le beat s’efface sur ${fade} temps avant la transition`);
   }
 
   /** Après la transition : démarre (ou relie) le groove du re-edit sur la phrase suivante, ou arrête le pont. */
@@ -1319,7 +1328,12 @@ class Brain implements DjBrain {
     if (!what) return;
     const cur = s.current!;
     if (what === 'stop-after') {
-      this.stopGroove(input.nowCtx, 8, out, `Le pont est fait : le beat du re-edit s'efface sous ${label(cur.genre)}`);
+      // le fondu doit finir avant la prochaine phrase (une sortie forcée pourrait y commencer)
+      const gg = this.grid(input.decks[cur.deck], cur, input.nowCtx);
+      let S0 = gg.nextPhrase;
+      while (S0 - input.nowCtx < 0.25) S0 += gg.phraseLen;
+      const fade = clamp(Math.floor((S0 - input.nowCtx) / gg.beatLen - 0.25), 0, 8);
+      this.stopGroove(input.nowCtx, fade, out, `Le pont est fait : le beat du re-edit s'efface sous ${label(cur.genre)}`);
       return;
     }
     if (!incoming.reEdit) return;
@@ -1365,6 +1379,71 @@ class Brain implements DjBrain {
     out.push({ type: 'groove-update', bpm: Math.round(live.bpm * 100) / 100, anchorCtx: live.downbeatCtx });
   }
 
+  // ------------------------------------------------------------------ sons d'ambiance (stingers)
+
+  /** Un son d'ambiance est-il permis maintenant ? Profil soirée / peak-time, réglage hôte, budget ~4 min,
+   *  jamais deux fois le même d'affilée, jamais sur un morceau calme. */
+  private stingerOk(input: BrainInput, kind: FxKind, energy: number | undefined): boolean {
+    const s = this.s;
+    if (input.settings.stingers === false || !this.env.profile.stingers) return false;
+    if (input.nowCtx - s.lastStingerCtx < STINGER_GAP_S) return false;
+    if (s.lastStingerKind === kind) return false;
+    return (energy ?? 0.6) >= 0.55;
+  }
+
+  private markStinger(kind: FxKind): void {
+    this.s.lastStingerCtx = this.lastNow;
+    this.s.lastStingerKind = kind;
+  }
+
+  private pickStinger(input: BrainInput, kinds: Array<[FxKind, number]>, energy: number | undefined): FxKind | undefined {
+    const w: Partial<Record<FxKind, number>> = {};
+    for (const [k, v] of kinds) if (this.stingerOk(input, k, energy)) w[k] = v;
+    return weightedPick(w, this.random);
+  }
+
+  /** Accent de transition : airhorn sur le drop de l'entrant (riser-drop / loop-roll), scratch avant le 1, siren sur le riser. */
+  private transitionStinger(input: BrainInput, t: TransitionTechnique, cur: Current, inAna: TrackAnalysis | undefined,
+    incomingStartCtx: number, beatLen: number, bpm: number, beats: number): FxCue | undefined {
+    if (needsSync(t) || !['riser-drop', 'loop-roll', 'cut', 'echo-out'].includes(t)) return undefined; // jamais pendant un fondu
+    if (this.random() >= 0.6) return undefined;
+    const energy = Math.min(inAna?.energy ?? 0.6, cur.analysis?.energy ?? 0.6);
+    const kinds: Array<[FxKind, number]> = t === 'cut' || t === 'echo-out' ? [['scratch', 1]]
+      : t === 'riser-drop' ? [['airhorn', 2], ['siren', 1], ['scratch', 1]] : [['airhorn', 2], ['scratch', 1]];
+    const kind = this.pickStinger(input, kinds, energy);
+    if (!kind) return undefined;
+    this.markStinger(kind);
+    if (kind === 'airhorn') return { kind, target: 'master', atCtx: incomingStartCtx, beats: 2, bpm, amount: 0.7, reason: 'airhorn sur le drop de l’entrant' };
+    if (kind === 'siren') {
+      const n = Math.min(8, Math.max(4, beats));
+      return { kind, target: 'master', atCtx: incomingStartCtx - n * beatLen, beats: n, bpm, amount: 0.5, reason: 'sirène sur la montée, jusqu’au 1' };
+    }
+    return { kind, target: 'master', atCtx: incomingStartCtx - 2 * beatLen, beats: 2, bpm, amount: 0.6, reason: 'scratch juste avant le 1' };
+  }
+
+  /** En cours de morceau, pendant une montée : sirène qui finit sur le 1, scratch juste avant, ou airhorn sur le drop. */
+  private midTrackStinger(input: BrainInput, g: Grid, S: number, cur: Current, out: BrainDecision[]): boolean {
+    if (this.random() >= 0.35) return false;
+    const st = usableStructure(cur.analysis);
+    const d = input.decks[cur.deck];
+    let dropAtS = true;
+    if (st) dropAtS = sectionAt(st, d.position + (S - input.nowCtx) * (d.rate || 1) + 60 / st.bpm / 2) === 'drop';
+    const kinds: Array<[FxKind, number]> = [['siren', 1], ['scratch', 1]];
+    if (dropAtS) kinds.push(['airhorn', 1.5]);
+    const kind = this.pickStinger(input, kinds, cur.analysis?.energy);
+    if (!kind) return false;
+    const beats = kind === 'siren' ? 8 : 2;
+    const atCtx = kind === 'airhorn' ? S : S - beats * g.beatLen;
+    if (atCtx < input.nowCtx + 0.05 || atCtx < cur.startedCtx + 8 * g.beatLen || atCtx < cur.transitionEndCtx) return false;
+    const amount = kind === 'airhorn' ? 0.7 : kind === 'siren' ? 0.5 : 0.6;
+    const reason = kind === 'airhorn' ? 'airhorn sur le 1 du drop' : kind === 'siren' ? 'sirène pendant la montée, jusqu’au drop' : 'scratch sur les deux derniers temps avant le drop';
+    this.markStinger(kind);
+    this.s.lastFxCtx = input.nowCtx;
+    out.push({ type: 'fx', cue: { kind, target: 'master', atCtx, beats, bpm: g.bpm, amount, reason } });
+    this.log(out, `Son d'ambiance : ${reason}`);
+    return true;
+  }
+
   // ------------------------------------------------------------------ 6. effets en cours de morceau
 
   private maybeFx(input: BrainInput, g: Grid, S: number, cur: Current, out: BrainDecision[]): void {
@@ -1375,6 +1454,7 @@ class Brain implements DjBrain {
     const now = input.nowCtx;
     if (now - s.lastFxCtx < profile.fxEveryPhrases * g.phraseLen) return;
     const section = input.decks[cur.deck].live?.section ?? 'unknown';
+    if (section === 'build' && g.reliable && this.midTrackStinger(input, g, S, cur, out)) return;
     const peak = this.env.targetEnergy >= 0.85;
     const vocal = cur.analysis?.vocalness ?? 0;
     const allowed: FxKind[] = [];
@@ -1391,6 +1471,7 @@ class Brain implements DjBrain {
     for (const k of allowed) if (profile.fxWeights[k]) w[k] = profile.fxWeights[k];
     const p = Math.min(0.9, profile.fxDensity * fxAmount * 2);
     if (this.random() >= p) return;
+    if (!g.reliable) { delete w.loop; delete w['loop-roll']; delete w.gate; } // boucles seulement sur une grille sûre
     const kind = weightedPick(w, this.random);
     if (!kind) return;
     let beats = 1;
