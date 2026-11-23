@@ -651,8 +651,30 @@ async function main(): Promise<void> {
       results.push(`démo ${id} (${t.title}) : drops ${st.dropPositions.map((d) => d.toFixed(1)).join(', ')} / vrais ${trueDrops.map((d) => d.toFixed(1)).join(', ')} ; outro ${st.outroPos?.toFixed(1)} / ${outro.toFixed(1)}`);
       assert.ok(Math.abs(st.bpm - (t.bpm ?? 0)) < 0.5, `${id} bpm ${st.bpm}`);
       assert.ok(near(trueDrops, st.dropPositions[0], P * 0.99), `${id} : drop principal ${st.dropPositions[0]} hors des vrais drops ${trueDrops}`);
-      assert.ok(st.outroPos !== undefined && Math.abs(st.outroPos - outro) <= 8 * P, `${id} outro ${st.outroPos} vs ${outro}`);
+      assert.ok(st.outroPos === undefined || Math.abs(st.outroPos - outro) <= 8 * P, `${id} outro ${st.outroPos} vs ${outro}`);
     }
+  });
+
+  await test('outro stricte : démos -1005 -1007 -1008 -1015 -1016 -> absente ou à moins de 4 mesures, jamais avant 66 %', () => {
+    const DSR = 22050;
+    const tracks = listDemoTracks();
+    const out: string[] = [];
+    for (const id of [-1005, -1007, -1008, -1015, -1016]) {
+      const t = tracks.find((x) => x.id === id)!;
+      const pcm = renderDemoPcm(id, DSR);
+      const dur = pcm.left.length / DSR;
+      const st = structureFromWaveform(waveformFromBuffer({ left: pcm.left, right: pcm.right, sampleRate: DSR }, id), t.bpm);
+      assert.ok(st, `${id} : pas de structure`);
+      const truth = getDemoStructure(id).find((x) => x.section === 'outro')!.startSec;
+      const bar = (4 * 60) / st.bpm;
+      out.push(`${id} ${st.outroPos?.toFixed(1) ?? 'aucune'}/${truth.toFixed(1)}`);
+      if (st.outroPos !== undefined) {
+        assert.ok(st.outroPos >= 0.66 * dur, `${id} : outro à ${st.outroPos.toFixed(1)} s, avant 66 % de ${dur.toFixed(0)} s`);
+        assert.ok(Math.abs(st.outroPos - truth) < 4 * bar, `${id} : outro ${st.outroPos.toFixed(1)} vs ${truth.toFixed(1)}`);
+      }
+      for (const sec of st.sections) if (sec.section === 'outro') assert.ok(sec.startPos >= 0.66 * dur, `${id} : section outro à ${sec.startPos}`);
+    }
+    results.push(`outro stricte (trouvée/vraie) : ${out.join(' ; ')}`);
   });
 
   await test('LiveBeatTracker : reset + outro avec durée connue', () => {

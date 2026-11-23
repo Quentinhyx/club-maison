@@ -624,5 +624,36 @@ for (const technique of ['echo-out', 'cut', 'riser-drop', 'loop-roll'] as const)
   t.c.stop();
 }
 
+// ------------------------------------------------------------------------------------------- 13 mise à jour d'une transition en cours, arrêt différé
+{
+  const t = setup();
+  t.c.start();
+  await t.decks.A.load(track(1));
+  await t.decks.A.play();
+  t.mixer.setParam('A.gain', 1);
+  await t.decks.B.load(track(2), 0);
+  const bpm = 124;
+  const spb = 60 / bpm;
+  const startCtx = clock.t + 6;
+  const plan: TransitionPlan = { id: 'u1', from: 'A', to: 'B', technique: 'long-blend', startCtx, beats: 32, bpm, incomingStartCtx: startCtx, incomingStartPos: 32, incomingRate: 1, accents: [], intensity: 0.5, reason: 'x' };
+  t.brain.push({ type: 'transition', plan });
+  await t.step(7);
+  const plays = t.decks.B.calls.filter((x) => x.op === 'play').length;
+  t.brain.push({ type: 'transition', plan: { ...plan, beats: 8, reason: 'Suivant' } });
+  await t.step(0.2);
+  ok(t.mixer.transitions.length === 2 && t.mixer.transitions[1].beats === 8, 'mise à jour : nouvelle automation programmée');
+  ok(t.decks.B.calls.filter((x) => x.op === 'play').length === plays, 'mise à jour : l’entrant n’est pas relancé');
+  ok(t.c.getTransition()?.endCtx === startCtx + 8 * spb, 'mise à jour : fin raccourcie');
+  t.mixer.looping.add('A');
+  t.brain.push({ type: 'stop', deck: 'A' });
+  await t.step(0.2);
+  ok(!t.decks.A.calls.some((x) => x.op === 'pause'), 'stop différé tant que A boucle');
+  t.mixer.looping.delete('A');
+  t.mixer.setParam('A.gain', 0);
+  await t.step(0.2);
+  ok(t.decks.A.calls.some((x) => x.op === 'pause'), 'stop exécuté après le relâché');
+  t.c.stop();
+}
+
 console.log(`${count - failures}/${count} vérifications OK`);
 if (failures) process.exit(1);

@@ -266,6 +266,7 @@ export class Conductor {
   private guestStatus: ConductorSnapshot['guest'];
   private seenRequests = new Set<string>();
   private failedTracks = new Set<number>();
+  private pendingStops = new Set<DeckId>();
   private playedRequests = new Set<string>();
   private emergencyAt = -Infinity;
   private currentGenre?: Genre;
@@ -553,6 +554,14 @@ export class Conductor {
       if (this.running) {
         this.driveTransition(now, states);
         this.driveFx(now, states);
+        for (const d of [...this.pendingStops]) {
+          if ((this.tr?.hold === 'holding' && this.tr.plan.from === d) || this.d.mixer.isLooping?.(d)) continue;
+          this.pendingStops.delete(d);
+          if (!this.isAudible(d) || safeParam(this.d.mixer, `${d}.gain` as ParamTarget, 0) < 0.08) {
+            void this.d.decks[d].pause().catch(() => {});
+            this.markEnded(d);
+          }
+        }
         this.driveScans(now, states);
         this.applyRamps(now, states);
         this.keepTempo(nowMs, states);
@@ -650,6 +659,12 @@ export class Conductor {
         }
         break;
       case 'stop': {
+        // le sortant tenu en boucle (attente de l'entrant) ne s'arrête qu'après le relâché effectif
+        if ((this.tr?.hold === 'holding' && this.tr.plan.from === dec.deck) || this.d.mixer.isLooping?.(dec.deck)) {
+          this.pendingStops.add(dec.deck);
+          this.log('info', `Arrêt de ${dec.deck} différé : la boucle le tient encore.`);
+          break;
+        }
         void this.d.decks[dec.deck].pause().catch(() => {});
         this.markEnded(dec.deck);
         break;
@@ -973,7 +988,11 @@ export class Conductor {
   // ------------------------------------------------------------------------------- transitions
 
   private startTransition(plan: TransitionPlan, now: number): void {
-    if (this.tr && this.tr.plan.id === plan.id) return;
+    if (this.tr && this.tr.plan.id === plan.id) {
+      // même id = mise à jour de la transition en cours (ex. « Suivant » : version raccourcie)
+      if (this.tr.playIssued) return this.updateTransition(this.tr, plan, now);
+      this.cancelTransition('transition mise à jour', true);
+    }
     if (this.tr && this.tr.phase === 'scheduled') this.cancelTransition('nouvelle transition');
     else if (this.tr && this.tr.phase === 'running') {
       this.log('warn', 'Transition refusée : une autre est déjà en cours.');
@@ -1006,6 +1025,9 @@ export class Conductor {
         seekTo = Math.max(0, plan.incomingStartPos - preroll * rate);
       } else {
         seekTo = undefined; // pas de seek : on part d'où la platine est
+        if (Math.abs(st.position - plan.incomingStartPos) > 0.5) {
+          this.log('warn', `Platine ${plan.to} : déplacement impossible, l'entrée se fera à ${st.position.toFixed(1)} s au lieu de ${plan.incomingStartPos.toFixed(1)} s.`);
+        }
         preroll = Math.max(0, (plan.incomingStartPos - st.position) / Math.max(0.5, rate));
       }
     }
@@ -1192,7 +1214,27 @@ export class Conductor {
     });
   }
 
-  private cancelTransition(why: string): void {
+  /** Nouvelle version d'une transition déjà lancée : l'entrant continue, seule l'automation change. */
+  private updateTransition(tr: RunningTransition, plan: TransitionPlan, now: number): void {
+    const spb = 60 / plan.bpm;
+    try {
+      this.d.mixer.cancelFrom(now);
+      tr.lanes = this.d.mixer.runTransition(plan);
+    } catch (e) {
+      this.log('error', `Mise à jour de la transition impossible : ${errMsg(e)}`);
+      return;
+    }
+    this.activeFx = this.activeFx.filter((f) => f.cue.atCtx < now);
+    for (const cue of plan.accents ?? []) this.activeFx.push({ cue, endCtx: cue.atCtx + (cue.beats * 60) / cue.bpm });
+    tr.plan = plan;
+    tr.audibleAt = plan.incomingStartCtx;
+    tr.endCtx = plan.startCtx + plan.beats * spb;
+    tr.relaxEndCtx = tr.endCtx + (plan.rateRelaxBeats ?? 0) * spb;
+    tr.phase = now < plan.startCtx ? 'scheduled' : 'running';
+    this.log('info', `Transition mise à jour : ${plan.technique} sur ${plan.beats} temps.`);
+  }
+
+  private cancelTransition(why: string, quiet = false): void {
     const tr = this.tr;
     if (!tr) return;
     const now = this.d.nowCtx();
@@ -1213,7 +1255,7 @@ export class Conductor {
     }
     this.activeFx = [];
     this.tr = undefined;
-    this.log('info', `Transition annulée : ${why}.`);
+    if (!quiet) this.log('info', `Transition annulée : ${why}.`);
   }
 
   private driveTransition(now: number, states: Record<DeckId, DeckState>): void {

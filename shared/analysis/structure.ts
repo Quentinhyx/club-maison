@@ -420,6 +420,37 @@ function computeStructure(w: TrackWaveform, mask: Uint8Array, bpmHint: number): 
   let lastMain = -1;
   for (let i = segs.length - 1; i >= 0; i--) if (!calm(segs[i])) { lastMain = i; break; }
   if (lastMain >= 0) for (let i = lastMain + 1; i < segs.length; i++) segs[i].section = 'outro';
+  // validation stricte de l'outro (dans le doute, pas d'outro : le cerveau gère la fin par la durée) :
+  // (a) dans le dernier tiers ; (b) basse en baisse d'au moins 40 % jusqu'à la fin par rapport au
+  // dernier passage principal, OU énergie en baisse (>= 10 %) puis non croissante jusqu'à la fin sur >= 16 temps.
+  // Un « body » plus calme mais qui varie encore (breaks, remontées) n'est pas une outro.
+  {
+    const dur = n / fps;
+    const mainRef = lastMain >= 0 ? median(Array.from(lr.slice(segs[lastMain].a, segs[lastMain].z + 1))) : 1;
+    const valid = (j: number): boolean => {
+      const a0 = segs[j].a;
+      if (bars[a0].start < dur * (2 / 3)) return false;
+      if (dur - bars[a0].start < 16 * beatSec) return false; // au moins 16 temps jusqu'à la fin
+      const tailLow = median(Array.from(lr.slice(a0, nb)));
+      if (tailLow <= 0.6 * mainRef) return true;
+      // énergie : marche descendante par rapport aux 4 mesures précédentes, puis plus aucune remontée
+      // jusqu'à la fin (dernière mesure incomplète ignorée), sur au moins 4 mesures (16 temps)
+      const e = bars.slice(a0).filter((b) => b.covered && b.start + barSec <= dur + 1e-6).map((b) => b.energy);
+      if (e.length < 4) return false;
+      for (let i = 1; i < e.length; i++) if (e[i] > e[i - 1] * 1.08 + 1e-3) return false;
+      const before = bars.slice(Math.max(0, a0 - 4), a0).filter((b) => b.covered).map((b) => b.energy);
+      return before.length > 0 && avg(e) <= 0.9 * avg(before);
+    };
+    let start = -1;
+    for (let j = 0; j < segs.length; j++) {
+      if (segs[j].section !== 'outro') continue;
+      if (valid(j)) { start = j; break; }
+    }
+    for (let j = 0; j < segs.length; j++) {
+      if (segs[j].section === 'outro' && (start < 0 || j < start)) segs[j].section = segs[j].kick ? 'body' : 'breakdown';
+    }
+    // un « breakdown » final non validé comme outro reste un breakdown ; un body final reste un body
+  }
   // montée : fin d'un breakdown où médiums + aigus montent nettement -> build
   const withBuild: Seg[] = [];
   for (const g of segs) {
@@ -520,7 +551,7 @@ function computeStructure(w: TrackWaveform, mask: Uint8Array, bpmHint: number): 
   // début d'outro recalé sur le premier temps où l'énergie et la basse baissent le plus (±2 mesures)
   if (outro > 0) {
     const p = refine(sections[outro].startPos, -1);
-    if (p > sections[outro - 1].startPos && p < sections[outro].endPos) { sections[outro].startPos = p; sections[outro - 1].endPos = p; }
+    if (p > sections[outro - 1].startPos && p < sections[outro].endPos && p >= (n / fps) * (2 / 3)) { sections[outro].startPos = p; sections[outro - 1].endPos = p; }
   }
   const covFrac = nCov / n;
   const contrast = clamp01(1 - (percentile(cov.map((b) => b.low), 0.1) / lowRef));

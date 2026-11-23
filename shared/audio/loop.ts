@@ -167,7 +167,9 @@ export const LOOP_WORKLET_NAME = 'club-maison-loop';
  */
 export const LOOP_WORKLET_SRC = `
 var __name = (t) => t;
-${LoopCore.toString()}
+// var X = ... : un bundler réécrit la déclaration de classe en classe anonyme ;
+// l'affectation garde la source valide dans les deux cas.
+var LoopCore = ${LoopCore.toString()};
 class ClubMaisonLoopProcessor extends AudioWorkletProcessor {
   constructor() {
     super();

@@ -64,7 +64,7 @@ function loopWorkletFix(): Plugin {
     transform(code, id) {
       if (!/shared[\\/]audio[\\/]loop\.ts$/.test(id)) return null;
       const needle = '${LoopCore.toString()}';
-      if (!code.includes(needle)) return null;
+      if (!code.includes(needle) || code.includes('var LoopCore = ${LoopCore.toString()}')) return null;
       return { code: code.replace(needle, 'var LoopCore = ${LoopCore.toString()};'), map: null };
     },
   };
