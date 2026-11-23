@@ -17,6 +17,12 @@ export interface Store {
   hdel(key: string, ...fields: string[]): Promise<void>;
   hgetall(key: string): Promise<Record<string, string>>;
   expire(key: string, ttlSec: number): Promise<void>;
+  /** Pose le champ seulement s'il n'existe pas. Renvoie true si posé. */
+  hsetnx(key: string, field: string, value: string): Promise<boolean>;
+  /** INCR atomique ; l'expiration est posée au premier incrément (fenêtre fixe). */
+  incr(key: string, ttlSec: number): Promise<number>;
+  /** Lectures groupées en un seul aller-retour (pipeline Redis). */
+  readMany(strings: string[], hashes: string[]): Promise<{ strings: Array<string | null>; hashes: Array<Record<string, string>> }>;
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -68,6 +74,24 @@ export class MemoryStore implements Store {
     const e = this.live(key);
     if (e) e.exp = this.now() + ttlSec * 1000;
   }
+  async hsetnx(key: string, field: string, value: string) {
+    const h = this.hash(key, true)!;
+    if (h.has(field)) return false;
+    h.set(field, value);
+    return true;
+  }
+  async incr(key: string, ttlSec: number) {
+    const e = this.live(key);
+    const n = (e && typeof e.v === 'string' ? Number(e.v) || 0 : 0) + 1;
+    this.m.set(key, { v: String(n), exp: e?.exp ?? this.now() + ttlSec * 1000 });
+    return n;
+  }
+  async readMany(strings: string[], hashes: string[]) {
+    return {
+      strings: await Promise.all(strings.map((k) => this.get(k))),
+      hashes: await Promise.all(hashes.map((k) => this.hgetall(k))),
+    };
+  }
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -96,7 +120,9 @@ export class RedisStore implements Store {
   async hset(key: string, field: string, value: string) { await this.r.hset(key, { [field]: value }); }
   async hdel(key: string, ...fields: string[]) { if (fields.length) await this.r.hdel(key, ...fields); }
   async hgetall(key: string) {
-    const raw: unknown = await this.r.hgetall(key);
+    return RedisStore.toRecord(await this.r.hgetall(key));
+  }
+  private static toRecord(raw: unknown): Record<string, string> {
     const out: Record<string, string> = {};
     if (Array.isArray(raw)) {
       // automaticDeserialization: false -> tableau plat [champ, valeur, ...]
@@ -107,6 +133,24 @@ export class RedisStore implements Store {
     return out;
   }
   async expire(key: string, ttlSec: number) { await this.r.expire(key, Math.ceil(ttlSec)); }
+  async hsetnx(key: string, field: string, value: string) {
+    return (await this.r.hsetnx(key, field, value)) === 1;
+  }
+  async incr(key: string, ttlSec: number) {
+    const [n] = await this.r.pipeline().incr(key).expire(key, Math.ceil(ttlSec), 'NX').exec<[number, number]>();
+    return Number(n);
+  }
+  async readMany(strings: string[], hashes: string[]) {
+    if (!strings.length && !hashes.length) return { strings: [], hashes: [] };
+    const p = this.r.pipeline();
+    for (const k of strings) p.get(k);
+    for (const k of hashes) p.hgetall(k);
+    const out = await p.exec<unknown[]>();
+    return {
+      strings: out.slice(0, strings.length).map((v) => (v === null || v === undefined ? null : String(v))),
+      hashes: out.slice(strings.length).map((v) => RedisStore.toRecord(v)),
+    };
+  }
 }
 
 // ---------------------------------------------------------------------------------------------

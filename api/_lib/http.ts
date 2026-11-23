@@ -1,6 +1,9 @@
 /** Utilitaires HTTP communs aux fonctions Vercel. */
 import type { VercelRequest, VercelResponse } from '@vercel/node';
-import { checkHostKey, normalizeParty, type Result } from './party.js';
+import {
+  clientIp, hostAccess, IP_REQUEST_LIMIT, IP_REQUEST_WINDOW_SEC, IP_WRITE_LIMIT, IP_WRITE_WINDOW_SEC,
+  normalizeParty, rateLimit, type Result,
+} from './party.js';
 import { getStore, type Store } from './store.js';
 
 const MAX_BODY = 16 * 1024;
@@ -67,14 +70,33 @@ export function jsonBody(req: VercelRequest): Record<string, unknown> | null {
   return b && typeof b === 'object' && !Array.isArray(b) ? (b as Record<string, unknown>) : null;
 }
 
-export function requireHost(req: VercelRequest, res: VercelResponse): boolean {
-  const r = checkHostKey(req.headers['x-host-key'], process.env.HOST_KEY);
+export function ipOf(req: VercelRequest): string {
+  return clientIp(req.headers);
+}
+
+/** Clé hôte obligatoire (avec anti-force-brute par IP). Envoie l'erreur et renvoie false sinon. */
+export async function requireHost(req: VercelRequest, res: VercelResponse, store: Store): Promise<boolean> {
+  const r = await hostAccess(store, ipOf(req), req.headers['x-host-key'], process.env.HOST_KEY);
   if (!r.ok) { sendResult(res, r); return false; }
   return true;
 }
 
-export function isHost(req: VercelRequest): boolean {
-  return checkHostKey(req.headers['x-host-key'], process.env.HOST_KEY).ok;
+/** Vrai si l'en-tête x-host-key est présent et juste (un essai faux compte comme un échec). */
+export async function isHost(req: VercelRequest, store: Store): Promise<boolean> {
+  if (!req.headers['x-host-key']) return false;
+  return (await hostAccess(store, ipOf(req), req.headers['x-host-key'], process.env.HOST_KEY)).ok;
+}
+
+/** Limites par IP pour les écritures invités ('write'), et en plus pour les demandes ('request'). */
+export async function limitIp(req: VercelRequest, res: VercelResponse, store: Store, kind: 'write' | 'request'): Promise<boolean> {
+  const ip = ipOf(req);
+  const w = await rateLimit(store, 'write', ip, IP_WRITE_LIMIT, IP_WRITE_WINDOW_SEC);
+  if (!w.ok) { sendResult(res, w); return false; }
+  if (kind === 'request') {
+    const r = await rateLimit(store, 'request', ip, IP_REQUEST_LIMIT, IP_REQUEST_WINDOW_SEC);
+    if (!r.ok) { sendResult(res, r); return false; }
+  }
+  return true;
 }
 
 /** Garde-fou : toute exception devient une 500 propre (avec CORS déjà posé). */

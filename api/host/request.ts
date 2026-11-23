@@ -5,7 +5,7 @@ import { guard, jsonBody, partyOf, prelude, requireHost, sendError, sendResult }
 /** POST /api/host/request (x-host-key) { id, status } -> GuestRequest */
 const run = guard(async (req, res, store) => {
   if (!prelude(req, res, 'POST')) return;
-  if (!requireHost(req, res)) return;
+  if (!(await requireHost(req, res, store))) return;
   const body = jsonBody(req);
   if (!body) return sendError(res, 400, 'invalid', 'Corps JSON attendu.');
   sendResult(res, await hostSetRequestStatus(store, partyOf(req), { id: body.id, status: body.status }, Date.now()));

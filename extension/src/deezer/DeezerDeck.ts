@@ -38,7 +38,10 @@ export class DeezerDeck implements DeckController {
     for (const l of this.listeners) l(e);
   }
 
+  private lastStateMs?: number;
+
   private applySnapshot(s: TabSnapshot): void {
+    this.lastStateMs = Date.now();
     const prev = this.state;
     this.snap = s;
     const capsChanged = JSON.stringify(prev.caps) !== JSON.stringify(s.caps);
@@ -126,8 +129,10 @@ export class DeezerDeck implements DeckController {
   async getStream(): Promise<MediaStream> {
     if (this.settings.captureMode === 'device') {
       const label = this.id === 'A' ? this.settings.deviceLabelA : this.settings.deviceLabelB;
-      if (!this.stream) {
+      if (!this.stream || !this.stream.getAudioTracks().some((t) => t.readyState === 'live')) {
+        this.stream?.getTracks().forEach((t) => t.stop());
         this.stream = await captureDevice(label);
+        this.watchStream(this.stream);
         // demande à l'onglet Deezer d'envoyer son son vers ce périphérique
         await this.bridge.command(this.id, { op: 'setSink', label }, 15_000).catch(() => {});
       }
@@ -148,9 +153,35 @@ export class DeezerDeck implements DeckController {
     if (this.stream && this.streamTab === tabId && this.stream.getAudioTracks().some((t) => t.readyState === 'live')) {
       return this.stream;
     }
+    // un onglet ne se capture qu'une fois : on libère l'ancien flux avant de recapturer
+    this.stream?.getTracks().forEach((t) => t.stop());
+    this.stream = undefined;
     this.stream = await captureTab(tabId);
     this.streamTab = tabId;
+    this.watchStream(this.stream);
     return this.stream;
+  }
+
+  private streamEnded = false;
+
+  private watchStream(s: MediaStream): void {
+    this.streamEnded = false;
+    const tr = s.getAudioTracks()[0];
+    if (tr) tr.onended = () => {
+      if (this.stream === s) this.streamEnded = true;
+    };
+  }
+
+  /** Santé pour le chef d'orchestre : capture terminée, dernier état reçu de l'onglet. */
+  health(): { streamEnded?: boolean; lastStateMs?: number } {
+    return { streamEnded: this.streamEnded, lastStateMs: this.lastStateMs };
+  }
+
+  /** Oublie le flux (pour forcer une recapture). */
+  dropStream(): void {
+    this.stream?.getTracks().forEach((t) => t.stop());
+    this.stream = undefined;
+    this.streamEnded = false;
   }
 
   on(listener: (e: DeckEvent) => void): () => void {

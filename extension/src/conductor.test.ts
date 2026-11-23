@@ -7,6 +7,7 @@ import type {
   ParamTarget, PartyState, TrackAnalysis, TrackRef, TransitionPlan, AutomationLane, GuestRequest, NowPlaying,
 } from '../../shared/contracts';
 import { phaseNudge } from '../../shared/audio/sync';
+import { computeAssignment } from './deezer/assign';
 import { Conductor, defaultCrowd, defaultRateRamp, type MixerLike } from './conductor';
 
 let failures = 0;
@@ -19,9 +20,9 @@ function ok(cond: unknown, msg: string) {
   }
 }
 
-const clock = { t: 100, ms: 1_000_000 };
+const clock = { t: 100, ms: 1_000_000, freezeCtx: false };
 const advance = (s: number) => {
-  clock.t += s;
+  if (!clock.freezeCtx) clock.t += s;
   clock.ms += s * 1000;
 };
 
@@ -88,6 +89,10 @@ class FakeDeck implements DeckController {
     return () => this.ls.delete(l);
   }
   dispose() {}
+  /** Le son sort-il vraiment (lecture et position qui avance) ? */
+  sounding(): boolean {
+    return this.state.status === 'playing' && this.playStartCtx !== undefined && clock.t >= this.playStartCtx;
+  }
   crash(msg: string) {
     this.state = { ...this.getState(), status: 'error', error: msg };
     for (const l of this.ls) l({ type: 'status', deck: this.id, status: 'error', error: msg });
@@ -145,8 +150,12 @@ class FakeMixer implements MixerLike {
     this.fxs.push(c);
     return [];
   }
+  levelFn: (d: DeckId) => number = () => 0;
+  muted = new Set<DeckId>();
   getLevels() {
-    return { A: 0, B: 0, master: 0 };
+    const a = this.muted.has('A') ? 0 : this.levelFn('A');
+    const b = this.muted.has('B') ? 0 : this.levelFn('B');
+    return { A: a, B: b, master: Math.max(a, b) };
   }
   setTempo(b: number) {
     this.tempo = b;
@@ -182,9 +191,16 @@ const analysis = (id: number): TrackAnalysis => ({
 });
 
 const latencies: number[] = [];
+const health: Partial<Record<DeckId, { streamEnded?: boolean; lastStateMs?: number }>> = {};
+const reconnects: DeckId[] = [];
+let reconnectOk = false;
 function setup(opts: { latency?: number; guest?: boolean; scan?: boolean; similar?: boolean } = {}) {
+  for (const k of Object.keys(health)) delete health[k as DeckId];
+  reconnects.length = 0;
+  reconnectOk = false;
   const decks = { A: new FakeDeck('A'), B: new FakeDeck('B') };
   const mixer = new FakeMixer();
+  mixer.levelFn = (d) => (decks[d].sounding() ? 0.1 : 0);
   const brain = new ScriptBrain();
   let inflight = 0;
   let maxInflight = 0;
@@ -209,6 +225,7 @@ function setup(opts: { latency?: number; guest?: boolean; scan?: boolean; simila
       catalogCalls.push(g);
       return Array.from({ length: 10 }, (_, i) => track(500 + i));
     },
+    analysisTimeoutMs: 300,
     analyze: (t) =>
       new Promise((res) => {
         inflight++;
@@ -221,6 +238,11 @@ function setup(opts: { latency?: number; guest?: boolean; scan?: boolean; simila
     fallbackTracks: () => [track(900, 'Secours')],
     startLatency: () => opts.latency ?? 0.4,
     reportLatency: (_d, sec) => latencies.push(sec),
+    deckHealth: (d) => health[d] ?? {},
+    reconnect: async (d) => {
+      reconnects.push(d);
+      return reconnectOk;
+    },
     similar: opts.similar ? async (t) => [track(t.id + 7000, 'Proche 1'), track(t.id + 7001, 'Proche 2')] : undefined,
     scan: opts.scan
       ? {
@@ -653,6 +675,158 @@ for (const technique of ['echo-out', 'cut', 'riser-drop', 'loop-roll'] as const)
   await t.step(0.2);
   ok(t.decks.A.calls.some((x) => x.op === 'pause'), 'stop exécuté après le relâché');
   t.c.stop();
+}
+
+// ------------------------------------------------------------------------------------------- 14 platine muette à l'antenne
+{
+  const t = setup();
+  t.c.start();
+  await t.decks.A.load(track(1));
+  await t.decks.A.play();
+  t.mixer.setParam('A.gain', 1);
+  t.mixer.setParam('B.gain', 0);
+  await t.decks.B.load(track(2));
+  await t.step(2);
+  ok(!t.c.isDead('A'), 'muette : A saine tant qu’il y a du son');
+  t.mixer.muted.add('A');
+  await t.step(4);
+  ok(!t.c.isDead('A'), 'muette : pas encore HS avant 5 s');
+  await t.step(1.5);
+  ok(t.c.isDead('A'), 'muette : A HS après 5 s sans son fader ouvert');
+  ok(t.decks.B.state.status === 'playing' && t.mixer.getParam('B.gain') === 1, 'muette : B prend l’antenne');
+  ok(t.brain.inputs[t.brain.inputs.length - 1].deadDecks?.includes('A'), 'muette : deadDecks transmis au cerveau');
+  t.brain.push({ type: 'load', deck: 'A', track: track(5), startAt: 0, reason: 'x' });
+  await t.step(0.2);
+  ok(!t.decks.A.calls.some((x) => x.op === 'load' && x.arg === 5), 'muette : pas de chargement sur une platine HS');
+  await t.step(10.5);
+  ok(reconnects.includes('A'), 'muette : reconnexion tentée toutes les 10 s');
+  reconnectOk = true;
+  t.mixer.muted.delete('A');
+  await t.step(10.5);
+  await flush();
+  ok(!t.c.isDead('A'), 'muette : A revient quand la capture est rétablie');
+  t.c.stop();
+}
+{
+  const t = setup();
+  t.c.start();
+  await t.decks.A.load(track(1));
+  await t.decks.A.play();
+  t.mixer.setParam('A.gain', 1);
+  await t.step(1);
+  health.A = { lastStateMs: clock.ms };
+  await t.step(4.5);
+  ok(t.c.isDead('A'), 'onglet muet : plus d’état depuis 4 s -> HS');
+  t.c.stop();
+}
+{
+  const t = setup();
+  t.c.start();
+  await t.decks.A.load(track(1));
+  await t.decks.A.play();
+  t.mixer.setParam('A.gain', 1);
+  await t.step(0.5);
+  health.A = { streamEnded: true };
+  await t.step(0.2);
+  ok(t.c.isDead('A'), 'capture terminée -> HS immédiatement');
+  t.c.stop();
+}
+
+// ------------------------------------------------------------------------------------------- 15 horloge murale (contexte audio suspendu)
+{
+  const t = setup();
+  t.c.start();
+  clock.freezeCtx = true;
+  await t.step(8);
+  await flush();
+  await t.step(0.5);
+  clock.freezeCtx = false;
+  ok(t.decks.A.calls.some((x) => x.op === 'load') || t.decks.B.calls.some((x) => x.op === 'load'), 'horloge murale : le silence est compté même si l’horloge audio est figée');
+  t.c.stop();
+}
+
+// ------------------------------------------------------------------------------------------- 16 abortedPlanId
+{
+  const t = setup();
+  t.c.start();
+  await t.decks.A.load(track(1));
+  await t.decks.A.play();
+  t.mixer.setParam('A.gain', 1);
+  await t.decks.B.load(track(2));
+  const sc = clock.t + 20;
+  t.brain.push({ type: 'transition', plan: { id: 'ab1', from: 'A', to: 'B', technique: 'bass-swap', startCtx: sc, beats: 16, bpm: 124, incomingStartCtx: sc, incomingStartPos: 0, incomingRate: 1, accents: [], intensity: 0.5, reason: 'x' } });
+  await t.step(0.3);
+  t.brain.push({ type: 'load', deck: 'B', track: track(3), startAt: 0, reason: 'autre' });
+  await t.step(0.3);
+  const withAbort = t.brain.inputs.filter((i) => i.abortedPlanId === 'ab1');
+  ok(withAbort.length === 1, `abortedPlanId transmis une seule fois (${withAbort.length})`);
+  ok(t.mixer.getParam('A.gain') === 1, 'abandon : la platine à l’antenne n’est pas coupée');
+  t.c.stop();
+}
+
+// ------------------------------------------------------------------------------------------- 17 « à suivre » pour les invités
+{
+  const t = setup();
+  await t.decks.A.load(track(1));
+  await t.decks.A.play();
+  await t.decks.B.load(track(2));
+  const st = t.c.deckStates();
+  ok(t.c.nextForGuests(st, 'A')?.id === 2, 'à suivre : la platine prête');
+  t.decks.B.state = { ...t.decks.B.state, status: 'ended' };
+  t.c.addToQueue(track(9));
+  ok(t.c.nextForGuests(t.c.deckStates(), 'A')?.id === 9, 'à suivre : sinon le 1er de la file');
+  t.c.removeFromQueue(9);
+  ok(t.c.nextForGuests(t.c.deckStates(), 'A') === undefined, 'à suivre : sinon rien');
+}
+
+// ------------------------------------------------------------------------------------------- 18 mémoire
+{
+  const t = setup();
+  t.c.start();
+  t.brain.push({ type: 'want-genre', genre: 'house', bpmMin: 100, bpmMax: 140, reason: 'x' });
+  await t.step(0.2);
+  await flush();
+  for (let i = 0; i < 260; i++) t.brain.push({ type: 'analyze', track: track(10_000 + i) });
+  for (let k = 0; k < 400; k++) {
+    await t.step(0.1);
+    while (t.analyzeResolvers.length) t.analyzeResolvers.shift()!();
+    await flush();
+  }
+  ok(t.c.cacheSizes().analyses <= 200 + 10, `mémoire : cache d’analyses borné (${t.c.cacheSizes().analyses})`);
+  const last = t.brain.inputs[t.brain.inputs.length - 1];
+  ok(Object.keys(last.analyses ?? {}).length <= last.candidates.length + 2, `mémoire : seules les analyses utiles vont au cerveau (${Object.keys(last.analyses ?? {}).length})`);
+  t.c.stop();
+}
+{
+  // analyse bloquée : l'emplacement est libéré
+  const t = setup();
+  t.c.start();
+  t.brain.push({ type: 'analyze', track: track(31) }, { type: 'analyze', track: track(32) }, { type: 'analyze', track: track(33) });
+  await t.step(0.3);
+  ok(t.getMax() === 2, 'analyses : 2 en parallèle');
+  await new Promise((r) => setTimeout(r, 400));
+  await t.step(0.3);
+  ok(t.getMax() === 3, `analyses : emplacement libéré après le délai (${t.getMax()})`);
+  t.c.stop();
+}
+
+// ------------------------------------------------------------------------------------------- 19 affectation des onglets
+{
+  const N = (id: number, goneAt?: number) => ({ tabId: id, incognito: false, goneAt });
+  const P = (id: number, goneAt?: number) => ({ tabId: id, incognito: true, goneAt });
+  const now = 1_000_000;
+  let a = computeAssignment([N(1), P(2)], {}, {}, now);
+  ok(a.A === 1 && a.B === 2, 'onglets : A normal, B privé');
+  a = computeAssignment([N(1), N(3)], {}, {}, now);
+  ok(a.A === 1 && a.B === undefined, 'onglets : jamais un onglet normal en B sans choix manuel');
+  a = computeAssignment([P(2)], {}, {}, now);
+  ok(a.A === undefined && a.B === 2, 'onglets : jamais un onglet privé en A sans choix manuel');
+  a = computeAssignment([N(1), N(3)], { B: 3 }, {}, now);
+  ok(a.A === 1 && a.B === 3, 'onglets : le choix manuel passe avant');
+  a = computeAssignment([N(1, now - 3000), N(4), P(2)], {}, { A: 1, B: 2 }, now);
+  ok(a.A === 1, 'onglets : un onglet qui se recharge garde sa platine');
+  a = computeAssignment([N(1, now - 9000), N(4), P(2)], {}, { A: 1, B: 2 }, now);
+  ok(a.A === 4, 'onglets : libéré après 8 s');
 }
 
 console.log(`${count - failures}/${count} vérifications OK`);

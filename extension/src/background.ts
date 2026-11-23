@@ -9,10 +9,13 @@
  *    aussi l'extension pour cet onglet, ce que Chrome peut exiger pour autoriser sa capture.
  */
 import type { DeckId } from '../../shared/contracts';
+import { computeAssignment, RELOAD_GRACE_MS } from './deezer/assign';
 import type { Assignment, ConsoleToSw, SwToConsole, SwToTab, TabInfo, TabToSw } from './deezer/protocol';
 
 interface TabEntry extends TabInfo {
   port: chrome.runtime.Port;
+  /** Port fermé (rechargement de l'onglet) : on garde la platine RELOAD_GRACE_MS. */
+  goneAt?: number;
 }
 
 const tabs = new Map<number, TabEntry>();
@@ -34,27 +37,8 @@ async function restore(): Promise<void> {
 void restore();
 
 function recompute(): void {
-  const list = [...tabs.values()];
-  const next: Assignment = {};
-  for (const d of ['A', 'B'] as DeckId[]) {
-    const m = manual[d];
-    if (m !== undefined && tabs.has(m)) next[d] = m;
-  }
-  const used = new Set(Object.values(next));
-  const free = list.filter((t) => !used.has(t.tabId));
-  if (next.A === undefined) {
-    const t = free.find((x) => !x.incognito) ?? free[0];
-    if (t) {
-      next.A = t.tabId;
-      used.add(t.tabId);
-    }
-  }
-  if (next.B === undefined) {
-    const rest = free.filter((x) => !used.has(x.tabId));
-    const t = rest.find((x) => x.incognito) ?? rest[0];
-    if (t) next.B = t.tabId;
-  }
-  assignment = next;
+  const list = [...tabs.values()].map((t) => ({ tabId: t.tabId, incognito: t.incognito, goneAt: t.goneAt }));
+  assignment = computeAssignment(list, manual, assignment, Date.now());
 }
 
 function deckOf(tabId: number): DeckId | null {
@@ -73,7 +57,7 @@ async function broadcastTabs(): Promise<void> {
   }
   const msg: SwToConsole = {
     kind: 'tabs',
-    tabs: [...tabs.values()].map(({ port: _p, ...t }) => t),
+    tabs: [...tabs.values()].filter((t) => t.goneAt === undefined).map(({ port: _p, goneAt: _g, ...t }) => t),
     assignment,
     incognitoAllowed,
   };
@@ -116,8 +100,17 @@ chrome.runtime.onConnect.addListener((port) => {
       }
     });
     port.onDisconnect.addListener(() => {
-      if (tabs.get(entry.tabId)?.port === port) tabs.delete(entry.tabId);
+      if (tabs.get(entry.tabId)?.port !== port) return;
+      // rechargement probable : la platine reste affectée quelques secondes
+      entry.goneAt = Date.now();
       void broadcastTabs();
+      setTimeout(() => {
+        const cur = tabs.get(entry.tabId);
+        if (cur === entry && entry.goneAt !== undefined) {
+          tabs.delete(entry.tabId);
+          void broadcastTabs();
+        }
+      }, RELOAD_GRACE_MS + 100);
     });
     void broadcastTabs();
     return;
@@ -178,7 +171,7 @@ async function onConsole(port: chrome.runtime.Port, m: ConsoleToSw): Promise<voi
     case 'cmd-tab': {
       const tabId = m.kind === 'cmd' ? assignment[m.deck] : m.tabId;
       const entry = tabId !== undefined ? tabs.get(tabId) : undefined;
-      if (!entry) {
+      if (!entry || entry.goneAt !== undefined) {
         const where = m.kind === 'cmd' ? `la platine ${m.deck}` : `l’onglet ${m.tabId}`;
         safePost(port, { kind: 'reply', id: m.id, ok: false, error: `Aucun onglet Deezer connecté pour ${where}. Ouvre www.deezer.com puis recharge l’onglet.` } satisfies SwToConsole);
         return;

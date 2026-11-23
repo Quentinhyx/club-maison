@@ -18,7 +18,7 @@ function loadMyRequests(): GuestRequest[] {
 }
 
 export function GuestPage() {
-  const { state, setCrowd, offline, loading } = usePartyState();
+  const { state, setCrowd, offline, loading } = usePartyState(undefined, 10_000);
   const { toast, show } = useToast();
   const crowd = state?.crowd;
   const np = state?.nowPlaying;
@@ -118,7 +118,7 @@ export function GuestPage() {
 
       {offline ? (
         <div className="banner banner--off">
-          <strong>Hors ligne.</strong> La piste ne répond pas pour l'instant. On réessaie toutes les 5 secondes.
+          <strong>Hors ligne.</strong> La piste ne répond pas pour l'instant. On réessaie toutes les 10 secondes.
         </div>
       ) : null}
 

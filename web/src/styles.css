@@ -151,6 +151,7 @@ a { color: inherit; }
   border-radius: var(--radius);
 }
 .banner--off { border-color: #3a3a40; }
+.banner--warn { border-color: var(--live); border-left-width: 3px; }
 .banner strong { font-weight: 700; }
 
 .foot { margin-top: 40px; padding-top: 20px; border-top: 1px solid var(--line); }

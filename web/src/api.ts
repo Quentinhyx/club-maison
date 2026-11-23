@@ -61,7 +61,11 @@ async function call<T>(method: 'GET' | 'POST', path: string, opts: { body?: unkn
   url.searchParams.set('party', opts.party ?? currentParty());
   const headers: Record<string, string> = {};
   if (opts.body !== undefined) headers['Content-Type'] = 'application/json';
-  if (opts.hostKey) headers['x-host-key'] = opts.hostKey;
+  if (opts.hostKey) {
+    headers['x-host-key'] = opts.hostKey;
+    // URL distincte : la vue publique de /api/state est mise en cache 2 s par le CDN.
+    url.searchParams.set('host', '1');
+  }
   const ctrl = new AbortController();
   const timer = setTimeout(() => ctrl.abort(), 10_000);
   let res: Response;
@@ -91,7 +95,7 @@ async function call<T>(method: 'GET' | 'POST', path: string, opts: { body?: unkn
 }
 
 export const api = {
-  state: (hostKey?: string) => call<PartyState>('GET', 'state', { hostKey }),
+  state: (hostKey?: string) => call<PartyStateEx>('GET', 'state', { hostKey }),
   search: (q: string) => call<TrackRef[]>('GET', `search?q=${encodeURIComponent(q)}`),
   vote: (genre: Genre) => call<CrowdState>('POST', 'vote', { body: { guestId: guestId(), genre } }),
   energy: (vote: EnergyVote) => call<CrowdState>('POST', 'energy', { body: { guestId: guestId(), vote } }),
@@ -107,8 +111,11 @@ export const api = {
 // État de la soirée, rafraîchi toutes les 5 s
 // ---------------------------------------------------------------------------------------------
 
-export function usePartyState(hostKey?: string) {
-  const [state, setState] = useState<PartyState | null>(null);
+/** PartyState + indicateur de stockage renvoyé par l'API (champ facultatif). */
+export type PartyStateEx = PartyState & { storage?: 'redis' | 'memory' };
+
+export function usePartyState(hostKey?: string, intervalMs = 5000) {
+  const [state, setState] = useState<PartyStateEx | null>(null);
   const [offline, setOffline] = useState(false);
   const [loading, setLoading] = useState(true);
   const [authError, setAuthError] = useState<ApiError | null>(null);
@@ -135,7 +142,7 @@ export function usePartyState(hostKey?: string) {
     void refresh();
     const id = window.setInterval(() => {
       if (document.visibilityState === 'visible') void refresh();
-    }, 5000);
+    }, intervalMs);
     const onVis = () => { if (document.visibilityState === 'visible') void refresh(); };
     document.addEventListener('visibilitychange', onVis);
     window.addEventListener('online', onVis);
@@ -144,7 +151,7 @@ export function usePartyState(hostKey?: string) {
       document.removeEventListener('visibilitychange', onVis);
       window.removeEventListener('online', onVis);
     };
-  }, [refresh]);
+  }, [refresh, intervalMs]);
 
   /** Applique localement une nouvelle foule (réponse d'un vote) sans attendre le prochain tour. */
   const setCrowd = useCallback((crowd: CrowdState) => {

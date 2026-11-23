@@ -34,6 +34,25 @@ const PARTY_TTL_SEC = 3 * 24 * 3600;
 /** Un vote de genre dont le poids passe sous ce seuil est oublié. */
 const MIN_WEIGHT = 0.01;
 
+/* Garde-fous anti-abus. Attention : à une soirée, tous les invités en Wi-Fi partagent la même
+ * IP publique (la box). Les limites par IP sont donc larges : elles arrêtent un script, pas une fête. */
+/** Écritures (votes, énergie, demandes) par IP et par fenêtre. */
+export const IP_WRITE_LIMIT = 300;
+export const IP_WRITE_WINDOW_SEC = 10 * 60;
+/** Demandes de morceaux par IP et par heure. */
+export const IP_REQUEST_LIMIT = 40;
+export const IP_REQUEST_WINDOW_SEC = 3600;
+/** Plafond global de demandes en attente pour une soirée. */
+export const MAX_PENDING_TOTAL = 50;
+/** Demandes renvoyées par GET /api/state (public / hôte). */
+export const PUBLIC_REQUESTS_MAX = 30;
+export const HOST_REQUESTS_MAX = 100;
+/** Anti-force-brute de la clé hôte : N échecs par IP dans la fenêtre -> blocage pour la fenêtre. */
+export const HOST_FAIL_LIMIT = 5;
+export const HOST_FAIL_WINDOW_SEC = 10 * 60;
+/** Verrou court autour des « vérifier puis écrire ». */
+const LOCK_TTL_SEC = 5;
+
 export const DEFAULT_HOST: HostSettings = {
   blockedGenres: [],
   blockedTrackIds: [],
@@ -49,7 +68,8 @@ export const DEFAULT_HOST: HostSettings = {
 export type ErrorCode =
   | 'invalid' | 'votes-closed' | 'requests-closed' | 'genre-blocked' | 'track-blocked'
   | 'energy-too-soon' | 'too-many-requests' | 'already-requested' | 'recently-played'
-  | 'not-found' | 'host-key-missing' | 'host-key-invalid';
+  | 'not-found' | 'host-key-missing' | 'host-key-invalid'
+  | 'queue-full' | 'rate-limited' | 'busy' | 'host-locked' | 'deezer-down';
 
 export type Result<T> =
   | { ok: true; value: T }
@@ -189,6 +209,51 @@ export function checkHostKey(provided: unknown, expected: string | undefined): R
   return ok(true);
 }
 
+/** IP du client (Vercel pose x-real-ip et x-forwarded-for). Inconnue -> 'unknown'. */
+export function clientIp(headers: Record<string, string | string[] | undefined>): string {
+  const first = (v: string | string[] | undefined) => (Array.isArray(v) ? v[0] : v)?.split(',')[0]?.trim();
+  const ip = first(headers['x-real-ip']) || first(headers['x-forwarded-for']) || '';
+  return /^[0-9a-fA-F:.]{2,45}$/.test(ip) ? ip.toLowerCase() : 'unknown';
+}
+
+/** Compteur par IP en fenêtre fixe (INCR + EXPIRE). */
+export async function rateLimit(
+  store: Store, bucket: string, ip: string, limit: number, windowSec: number,
+): Promise<Result<true>> {
+  const n = await store.incr(`cm:rl:${bucket}:${ip}`, windowSec);
+  if (n > limit) {
+    const msg = bucket === 'request'
+      ? 'Beaucoup de demandes depuis ce réseau. Laisse passer un peu de musique et réessaie.'
+      : 'Ça vote beaucoup depuis ce réseau. Souffle un peu et réessaie dans quelques minutes.';
+    return fail(429, 'rate-limited', msg, windowSec);
+  }
+  return ok(true);
+}
+
+/**
+ * Vérifie la clé hôte avec anti-force-brute : après HOST_FAIL_LIMIT échecs en HOST_FAIL_WINDOW_SEC
+ * pour une IP, toute tentative (même juste) est refusée en 429 jusqu'à la fin de la fenêtre.
+ */
+export async function hostAccess(
+  store: Store, ip: string, provided: unknown, expected: string | undefined,
+): Promise<Result<true>> {
+  if (!expected) return checkHostKey(provided, expected);
+  const key = `cm:hostfail:${ip}`;
+  const fails = Number(await store.get(key)) || 0;
+  if (fails >= HOST_FAIL_LIMIT) {
+    return fail(429, 'host-locked', 'Trop de clés incorrectes. Réessaie dans 10 minutes.', HOST_FAIL_WINDOW_SEC);
+  }
+  const r = checkHostKey(provided, expected);
+  if (!r.ok && r.status === 401) await store.incr(key, HOST_FAIL_WINDOW_SEC);
+  return r;
+}
+
+async function withLock<T>(store: Store, name: string, fn: () => Promise<Result<T>>, busy: Result<T>): Promise<Result<T>> {
+  const key = `cm:lock:${name}`;
+  if (!(await store.setNX(key, '1', LOCK_TTL_SEC))) return busy;
+  try { return await fn(); } finally { await store.del(key).catch(() => undefined); }
+}
+
 // ---------------------------------------------------------------------------------------------
 // Stockage d'une soirée
 // ---------------------------------------------------------------------------------------------
@@ -227,7 +292,10 @@ export async function getNowPlaying(store: Store, party: string, now: number): P
 }
 
 async function loadRequests(store: Store, party: string, now: number): Promise<RequestRec[]> {
-  const all = await store.hgetall(k(party).req);
+  return parseRequests(store, party, await store.hgetall(k(party).req), now);
+}
+
+async function parseRequests(store: Store, party: string, all: Record<string, string>, now: number): Promise<RequestRec[]> {
   const out: RequestRec[] = [];
   const stale: string[] = [];
   for (const [id, raw] of Object.entries(all)) {
@@ -264,21 +332,42 @@ export function maskGuestId(id: string): string {
   return 'g' + (h >>> 0).toString(36);
 }
 
+/** Au plus `max` demandes : en attente d'abord (plus anciennes en tête), puis acceptées,
+ *  puis les plus récentes jouées / refusées (pour que les invités voient le sort des leurs). */
+export function limitRequests<T extends GuestRequest>(list: T[], max: number): T[] {
+  const by = (st: GuestRequest['status']) => list.filter((r) => r.status === st);
+  const done = list.filter((r) => r.status === 'played' || r.status === 'rejected')
+    .sort((a, b) => b.createdAt - a.createdAt);
+  return [...by('pending'), ...by('accepted'), ...done].slice(0, max);
+}
+
 function publicRequest(r: RequestRec, reveal: boolean): GuestRequest {
   const { updatedAt: _u, ...rest } = r;
   return reveal ? rest : { ...rest, guestId: maskGuestId(r.guestId) };
 }
 
+interface PartyRaw { host: string | null; now: string | null; genre: Record<string, string>; energy: Record<string, string>; req: Record<string, string> }
+
+/** Toutes les lectures d'une soirée en un seul aller-retour. */
+async function readParty(store: Store, party: string): Promise<PartyRaw> {
+  const keys = k(party);
+  const r = await store.readMany([keys.host, keys.now], [keys.genre, keys.energy, keys.req]);
+  return { host: r.strings[0], now: r.strings[1], genre: r.hashes[0], energy: r.hashes[1], req: r.hashes[2] };
+}
+
 export async function getCrowd(
   store: Store, party: string, now: number, opts: { reveal?: boolean } = {},
 ): Promise<CrowdState> {
-  const keys = k(party);
-  const [host, genreAll, energyAll, requests] = await Promise.all([
-    getHost(store, party),
-    store.hgetall(keys.genre),
-    store.hgetall(keys.energy),
-    loadRequests(store, party, now),
-  ]);
+  return crowdFrom(store, party, await readParty(store, party), now, opts);
+}
+
+async function crowdFrom(
+  store: Store, party: string, raw: PartyRaw, now: number, opts: { reveal?: boolean },
+): Promise<CrowdState> {
+  const host: HostSettings = { ...DEFAULT_HOST, ...(parse<Partial<HostSettings>>(raw.host) ?? {}) };
+  const genreAll = raw.genre;
+  const energyAll = raw.energy;
+  const requests = await parseRequests(store, party, raw.req, now);
 
   const genreWeights: Partial<Record<Genre, number>> = {};
   let lastUpdate = 0;
@@ -310,7 +399,8 @@ export async function getCrowd(
   return {
     genreWeights,
     energy: Math.round(energy * 1000) / 1000,
-    requests: requests.map((r) => publicRequest(r, !!opts.reveal)),
+    requests: limitRequests(requests, opts.reveal ? HOST_REQUESTS_MAX : PUBLIC_REQUESTS_MAX)
+      .map((r) => publicRequest(r, !!opts.reveal)),
     host,
     updatedAt: lastUpdate || now,
   };
@@ -319,10 +409,9 @@ export async function getCrowd(
 export async function getPartyState(
   store: Store, party: string, now: number, opts: { reveal?: boolean } = {},
 ): Promise<PartyState> {
-  const [crowd, nowPlaying] = await Promise.all([
-    getCrowd(store, party, now, opts),
-    getNowPlaying(store, party, now),
-  ]);
+  const raw = await readParty(store, party);
+  const crowd = await crowdFrom(store, party, raw, now, opts);
+  const nowPlaying = parse<NowPlaying>(raw.now) ?? { updatedAt: now };
   return { crowd, nowPlaying };
 }
 
@@ -366,16 +455,38 @@ export async function voteEnergy(
   if (!host.votesOpen) return fail(403, 'votes-closed', "Les votes sont fermés pour l'instant.");
 
   const key = k(party).energy;
-  const prev = parse<EnergyRec>(await store.hget(key, guestId));
-  if (prev && now - prev.last < ENERGY_COOLDOWN) {
-    const wait = Math.ceil((ENERGY_COOLDOWN - (now - prev.last)) / 1000);
-    return fail(429, 'energy-too-soon', `Doucement : tu pourras revoter dans ${wait} s.`, wait);
-  }
-  const carried = prev ? prev.s * decay(now - prev.t, ENERGY_HALF_LIFE) : 0;
-  const s = Math.max(-ENERGY_GUEST_CAP, Math.min(ENERGY_GUEST_CAP, carried + vote));
-  await store.hset(key, guestId, JSON.stringify({ s, t: now, last: now } satisfies EnergyRec));
-  await touch(store, key);
+  // Verrou par invité : deux appuis simultanés ne passent pas tous les deux le délai de 30 s.
+  const written = await withLock<true>(store, `${party}:energy:${guestId}`, async () => {
+    const prev = parse<EnergyRec>(await store.hget(key, guestId));
+    if (prev && now - prev.last < ENERGY_COOLDOWN) {
+      const wait = Math.ceil((ENERGY_COOLDOWN - (now - prev.last)) / 1000);
+      return fail(429, 'energy-too-soon', `Doucement : tu pourras revoter dans ${wait} s.`, wait);
+    }
+    const carried = prev ? prev.s * decay(now - prev.t, ENERGY_HALF_LIFE) : 0;
+    const s = Math.max(-ENERGY_GUEST_CAP, Math.min(ENERGY_GUEST_CAP, carried + vote));
+    await store.hset(key, guestId, JSON.stringify({ s, t: now, last: now } satisfies EnergyRec));
+    await touch(store, key);
+    return ok(true);
+  }, fail(429, 'energy-too-soon', 'Doucement : ton vote est déjà en route.', 2));
+  if (!written.ok) return written;
+
+  // Ménage occasionnel des votes d'énergie éteints.
+  if (Math.random() < 0.1) await purgeEnergy(store, party, now);
   return ok(await getCrowd(store, party, now));
+}
+
+/** Supprime les votes d'énergie dont le poids est devenu négligeable. */
+export async function purgeEnergy(store: Store, party: string, now: number): Promise<number> {
+  const key = k(party).energy;
+  const all = await store.hgetall(key);
+  const stale = Object.entries(all)
+    .filter(([, raw]) => {
+      const e = parse<EnergyRec>(raw);
+      return !e || (now - e.last > ENERGY_COOLDOWN && Math.abs(e.s * decay(now - e.t, ENERGY_HALF_LIFE)) < MIN_WEIGHT);
+    })
+    .map(([id]) => id);
+  if (stale.length) await store.hdel(key, ...stale);
+  return stale.length;
 }
 
 export async function addRequest(
@@ -395,6 +506,18 @@ export async function addRequest(
   if (host.blockedTrackIds.includes(track.id)) {
     return fail(403, 'track-blocked', "Ce morceau n'est pas au programme ce soir.");
   }
+  // Verrous courts : même morceau demandé en même temps par deux invités, ou même invité qui
+  // envoie deux demandes d'un coup (sinon les vérifications ci-dessous laissent passer les deux).
+  return withLock(store, `${party}:track:${track.id}`, () =>
+    withLock(store, `${party}:guest:${guestId}`, () => insertRequest(store, party, guestId, track, input.guestName, host, now, newId),
+      fail(429, 'busy', 'Une demande est déjà en route, une seconde.')),
+  fail(409, 'already-requested', 'Quelqu’un demande ce son au même moment, il est dans la file.'));
+}
+
+async function insertRequest(
+  store: Store, party: string, guestId: string, track: TrackRef, guestNameRaw: unknown,
+  host: HostSettings, now: number, newId: () => string,
+): Promise<Result<GuestRequest>> {
   const [requests, played, np] = await Promise.all([
     loadRequests(store, party, now),
     loadPlayed(store, party, now),
@@ -409,6 +532,9 @@ export async function addRequest(
   if (np.next?.id === track.id) {
     return fail(409, 'already-requested', 'Ce son arrive juste après, tends l’oreille.');
   }
+  if (requests.filter((r) => r.status === 'pending').length >= MAX_PENDING_TOTAL) {
+    return fail(429, 'queue-full', 'File pleine : le DJ a déjà de quoi faire. Réessaie un peu plus tard.');
+  }
   const mine = requests.filter((r) => r.guestId === guestId && r.status === 'pending').length;
   if (mine >= host.maxRequestsPerGuest) {
     return fail(429, 'too-many-requests',
@@ -422,10 +548,12 @@ export async function addRequest(
     updatedAt: now,
     status: 'pending',
   };
-  const name = parseGuestName(input.guestName);
+  const name = parseGuestName(guestNameRaw);
   if (name) rec.guestName = name;
   const key = k(party).req;
-  await store.hset(key, rec.id, JSON.stringify(rec));
+  if (!(await store.hsetnx(key, rec.id, JSON.stringify(rec)))) {
+    return fail(429, 'busy', 'Petit accroc, renvoie ta demande.');
+  }
   await touch(store, key);
   return ok(publicRequest(rec, true));
 }

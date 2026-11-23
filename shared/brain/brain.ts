@@ -74,6 +74,8 @@ interface Current {
   playTarget: number;
   bridge: boolean;
   reEdit?: ReEdit;
+  /** Plan de transition qui a amené ce morceau (pour un éventuel abandon par la table). */
+  planId?: string;
 }
 interface GrooveState { deck: DeckId; plan: GroovePlan; stage: 1 | 2; lastUpdateCtx: number; wantBass: boolean }
 interface Running { plan: TransitionPlan; endCtx: number; incoming: Planned; hadOutgoing: boolean }
@@ -111,6 +113,13 @@ interface State {
   /** Sons d'ambiance : dernier placé (budget ~4 min, jamais deux fois le même d'affilée). */
   lastStingerCtx: number;
   lastStingerKind?: FxKind;
+  /** Abandons de transition signalés par le chef d'orchestre. */
+  lastAbortSeen?: string;
+  aborted: Set<string>;
+  /** Morceau d'avant la dernière transition (restauré si elle est abandonnée). */
+  prevCurrent?: Current;
+  /** Mode une seule platine : instant (ctx) de l'enchaînement en cut sur la même platine. */
+  singleExitAt?: number;
   /** 'stop' différé : l'entrant n'est pas encore parti (la table boucle le sortant). */
   pendingStop?: DeckId;
   tracksSinceReEdit: number;
@@ -293,7 +302,7 @@ function initialState(): State {
     targetSince: 0, path: [], lastEvalS: -Infinity, lastFxCtx: -Infinity,
     analyses: new Map(), analyzeAsked: new Set(), wantAsked: new Map(), plays: new Map(),
     artists: [], badIds: new Set(), logged: new Set(), planCounter: 0,
-    lastRatePhrase: -Infinity, lastStingerCtx: -Infinity, tracksSinceReEdit: Infinity, reEditCount: 0, skips: [], bannedArtists: new Map(),
+    lastRatePhrase: -Infinity, lastStingerCtx: -Infinity, tracksSinceReEdit: Infinity, reEditCount: 0, skips: [], bannedArtists: new Map(), aborted: new Set(),
   };
 }
 
@@ -315,6 +324,12 @@ class Brain implements DjBrain {
     this.ingest(input);
     this.env = this.makeEnv(input);
     this.adopt(input, out);
+    const ab = input.abortedPlanId;
+    if (ab !== undefined && ab !== s.lastAbortSeen) {
+      s.lastAbortSeen = ab;
+      this.handleAbort(input, ab, out);
+    }
+    if (s.planned && this.dead(input, s.planned.deck)) s.planned = undefined;
     const skip = input.skipRequestedAt;
     if (skip !== undefined && skip !== s.lastSkipSeen) {
       const first = s.lastSkipSeen === undefined && !s.current && !s.running;
@@ -382,6 +397,37 @@ class Brain implements DjBrain {
     };
   }
 
+  private dead(input: BrainInput, d: DeckId): boolean {
+    return !!input.deadDecks?.includes(d);
+  }
+
+  /**
+   * Transition abandonnée par le chef d'orchestre (entrant jamais démarré, platine HS) : on oublie le
+   * plan, le sortant continue (s'il joue encore réellement) et on replanifie la sortie.
+   */
+  private handleAbort(input: BrainInput, id: string, out: BrainDecision[]): void {
+    const s = this.s;
+    s.aborted.add(id);
+    if (s.running && s.running.plan.id === id) {
+      const inc = s.running.incoming;
+      s.plays.delete(inc.track.id);
+      s.running = undefined;
+      s.planned = undefined;
+      s.pendingGroove = undefined;
+      s.lastEvalS = -Infinity;
+      this.log(out, `Transition abandonnée par la table : ${s.current ? `${trackName(s.current.track)} continue, ` : ''}je replanifie la sortie`);
+    } else if (s.current?.planId === id) {
+      const prev = s.prevCurrent;
+      s.plays.delete(s.current.track.id);
+      const alive = prev && input.decks[prev.deck].track?.id === prev.track.id && input.decks[prev.deck].status === 'playing';
+      s.current = alive ? prev : undefined;
+      s.pendingStop = undefined;
+      s.planned = undefined;
+      s.lastEvalS = -Infinity;
+      this.log(out, `Transition abandonnée par la table : ${alive ? `${trackName(prev!.track)} continue, ` : ''}je replanifie la sortie`);
+    }
+  }
+
   /** File vide et aucun vote : le public ne pilote pas, on continue dans le même registre. */
   private crowdIdle(input: BrainInput): boolean {
     if (input.queue.length > 0) return false;
@@ -421,6 +467,7 @@ class Brain implements DjBrain {
     const cur = s.current;
     if (!cur) return;
     const genreChanged = this.rememberSkip(input, cur, out);
+    if (this.dead(input, other(cur.deck))) { s.singleExitAt = now; return; } // une seule platine : cut sur elle-même
     // morceau préparé : remplacé s'il ressemble trop au zappé ou si rien n'est prêt
     const ctx = this.scoreCtx(input, s.target ?? input.settings.baseGenre);
     let p = s.planned;
@@ -534,7 +581,7 @@ class Brain implements DjBrain {
     const d = input.decks[cur.deck];
     if (d.track?.id === cur.track.id && (d.status === 'playing' || d.status === 'paused')) return;
     // la table tient le sortant en boucle tant que l'entrant n'est pas réellement parti (holdWithLoop)
-    if (d.track?.id === cur.track.id && (d.status === 'loading' || d.status === 'ready')) return;
+    if (d.track?.id === cur.track.id && (d.status === 'loading' || d.status === 'ready') && !(cur.planId && this.s.aborted.has(cur.planId))) return;
     this.log(out, `Le morceau ${trackName(cur.track)} s'est arrêté (${d.status}) : on relance la suite`);
     this.stopGroove(input.nowCtx, 0, out);
     this.s.current = undefined;
@@ -814,7 +861,11 @@ class Brain implements DjBrain {
       }
     }
     if (!next || (p && next.track.id === p.track.id)) return;
-    const deck: DeckId = p?.deck ?? (s.current ? other(s.current.deck) : input.decks.A.status === 'playing' ? 'B' : 'A');
+    let deck: DeckId;
+    if (p) deck = p.deck;
+    else if (s.current) deck = other(s.current.deck);
+    else deck = input.decks.A.status === 'playing' || this.dead(input, 'A') ? 'B' : 'A';
+    if (this.dead(input, deck)) return; // une seule platine : le suivant sera chargé sur elle au moment de sortir
     this.emitLoad(input, next, deck, why, out);
   }
 
@@ -892,7 +943,7 @@ class Brain implements DjBrain {
     const bpm = bpmOf(p);
     const startCtx = input.nowCtx + 0.1;
     const plan: TransitionPlan = {
-      id: this.planId(p), from: other(p.deck), to: p.deck, technique: 'cut', startCtx, beats: 1, bpm,
+      id: this.planId(p), from: this.dead(input, other(p.deck)) ? p.deck : other(p.deck), to: p.deck, technique: 'cut', startCtx, beats: 1, bpm,
       incomingStartCtx: startCtx, incomingStartPos: p.startAt, incomingRate: 1, accents: [], intensity: 0,
       preRollBeats: 0, holdWithLoop: true,
       reason: `Ouverture : ${trackName(p.track)} (${label(p.genre)}, ${r0(bpm)} BPM)`,
@@ -914,7 +965,8 @@ class Brain implements DjBrain {
   private finish(input: BrainInput, out: BrainDecision[]): void {
     const s = this.s;
     const r = s.running!;
-    if (r.hadOutgoing) {
+    s.prevCurrent = s.current;
+    if (r.hadOutgoing && r.plan.from !== r.plan.to) {
       if (input.decks[r.plan.to].status === 'playing') out.push({ type: 'stop', deck: r.plan.from });
       else s.pendingStop = r.plan.from;
     }
@@ -923,7 +975,7 @@ class Brain implements DjBrain {
     s.current = {
       deck: r.plan.to, track: r.incoming.track, analysis: r.incoming.analysis ?? s.analyses.get(r.incoming.track.id),
       genre: r.incoming.genre, source: r.incoming.source, startedCtx: r.plan.incomingStartCtx, transitionEndCtx: r.endCtx,
-      playTarget: this.choosePlayTarget(input.settings, r.incoming.genre, bridge), bridge, reEdit: r.incoming.reEdit,
+      playTarget: this.choosePlayTarget(input.settings, r.incoming.genre, bridge), bridge, reEdit: r.incoming.reEdit, planId: r.plan.id,
     };
     if (r.incoming.reEdit) { s.tracksSinceReEdit = 0; s.reEditCount++; } else s.tracksSinceReEdit++;
     s.running = undefined;
@@ -971,6 +1023,7 @@ class Brain implements DjBrain {
     const rate = d.rate || 1;
     const duration = d.duration || cur.track.duration;
     const endCtx = now + Math.max(0, duration - d.position) / rate;
+    if (this.dead(input, other(cur.deck))) { this.evaluateSingle(input, cur, g, endCtx, out); return; }
     const p = s.planned;
     const isReady = !!p && this.ready(input, p);
 
@@ -1033,6 +1086,42 @@ class Brain implements DjBrain {
     this.grooveBuild(S, g, out);
     if (why && !isReady) this.logOnce(out, `nr:${cur.track.id}`, `Il faudrait sortir (${why}) mais le morceau suivant n'est pas prêt`);
     this.maybeFx(input, g, S, cur, out);
+  }
+
+  /**
+   * Une seule platine vivante (l'autre dans deadDecks) : on laisse jouer jusqu'à maxPlaySeconds (ou la
+   * fin du morceau), puis 'load' du suivant sur la même platine et 'cut' sur elle-même. Court blanc accepté.
+   */
+  private evaluateSingle(input: BrainInput, cur: Current, g: Grid, endCtx: number, out: BrainDecision[]): void {
+    const s = this.s;
+    const now = input.nowCtx;
+    this.logOnce(out, `single:${cur.deck}`, `Une seule platine disponible (${cur.deck}) : le morceau va jusqu'à la durée max, puis coupe sur le 1 le temps de charger le suivant`);
+    if (s.singleExitAt === undefined) {
+      const maxCtx = cur.startedCtx + input.settings.maxPlaySeconds;
+      let S = g.nextPhrase;
+      while (S - now < 0.25) S += g.phraseLen;
+      const limit = Math.min(endCtx - 1, maxCtx);
+      if (S + g.phraseLen > limit) s.singleExitAt = Math.min(S, endCtx - 0.5);
+      else return;
+    }
+    if (now < s.singleExitAt - 0.15) return;
+    s.singleExitAt = undefined;
+    const ctx = this.scoreCtx(input, s.target ?? input.settings.baseGenre);
+    const { pick, fallback } = this.pickFromQueue(input, ctx, out);
+    const next = pick ?? this.pickCandidate(input, ctx) ?? fallback;
+    if (!next) { this.log(out, 'Une seule platine disponible et aucun morceau pour enchaîner'); return; }
+    this.stopGroove(now, 0, out);
+    this.emitLoad(input, next, cur.deck, 'Une seule platine disponible', out);
+    const p = s.planned!;
+    p.reEdit = undefined;
+    const startCtx = now + 0.05;
+    const plan: TransitionPlan = {
+      id: this.planId(p), from: cur.deck, to: cur.deck, technique: 'cut', startCtx, beats: 1, bpm: g.bpm,
+      incomingStartCtx: startCtx, incomingStartPos: p.startAt, incomingRate: 1, accents: [], intensity: 0,
+      preRollBeats: 0, holdWithLoop: true,
+      reason: `Une seule platine disponible : coupe sur le 1 vers ${trackName(p.track)}, court blanc le temps du chargement`,
+    };
+    this.commit(input, plan, p, false, out);
   }
 
   private emergencyCut(input: BrainInput, cur: Current, p: Planned, g: Grid, out: BrainDecision[]): void {

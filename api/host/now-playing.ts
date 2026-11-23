@@ -5,7 +5,7 @@ import { guard, jsonBody, partyOf, prelude, requireHost, sendError, sendResult }
 /** POST /api/host/now-playing (x-host-key) NowPlaying -> NowPlaying */
 const run = guard(async (req, res, store) => {
   if (!prelude(req, res, 'POST')) return;
-  if (!requireHost(req, res)) return;
+  if (!(await requireHost(req, res, store))) return;
   const body = jsonBody(req);
   if (!body) return sendError(res, 400, 'invalid', 'Corps JSON attendu.');
   const r = await hostSetNowPlaying(store, partyOf(req), body, Date.now());

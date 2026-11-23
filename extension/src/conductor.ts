@@ -128,6 +128,12 @@ export interface ConductorDeps {
   reportLatency?(deck: DeckId, seconds: number): void;
   /** Morceaux similaires au morceau qui commence (radio de l'artiste, artistes proches, ou démo). */
   similar?(track: TrackRef): Promise<TrackRef[]>;
+  /** Santé d'une platine (capture terminée, dernier état reçu de l'onglet en ms murales). */
+  deckHealth?(deck: DeckId): { streamEnded?: boolean; lastStateMs?: number };
+  /** Tente de rebrancher le son d'une platine HS ; true si la capture est revenue. */
+  reconnect?(deck: DeckId): Promise<boolean>;
+  /** Délai maximal d'une analyse avant de libérer son emplacement (ms). */
+  analysisTimeoutMs?: number;
   scan?: ScanSupport;
   timers?: { setTimeout(fn: () => void, ms: number): unknown; clearTimeout(h: unknown): void };
   tickMs?: number;
@@ -171,6 +177,7 @@ export interface ConductorSnapshot {
   /** Pré-écoute en cours : platine, morceau, couverture 0..1. */
   scans: Partial<Record<DeckId, { trackId: number; coverage: number }>>;
   skipRequestedAt?: number;
+  deadDecks: DeckId[];
 }
 
 export function defaultCrowd(): CrowdState {
@@ -226,6 +233,12 @@ interface RunningTransition {
 export interface LoopView { deck: DeckId; atCtx: number; beats: number; bpm: number; kind: 'loop' | 'loop-roll' | 'hold' }
 
 const PREROLL_BEATS = 8;
+const ANALYSIS_CACHE = 200;
+/** Platine à l'antenne sous ce niveau (≈ -60 dBFS) pendant DEAD_SILENCE_MS : son perdu. */
+const DEAD_LEVEL = 0.001;
+const DEAD_SILENCE_MS = 5000;
+const STALE_STATE_MS = 4000;
+const RECONNECT_EVERY_MS = 10_000;
 /** Au-delà, on abandonne l'entrant qui ne démarre pas (en temps du sortant). */
 const MAX_HOLD_BEATS = 64;
 const TAIL_SECONDS = 4;
@@ -261,11 +274,19 @@ export class Conductor {
   private loading: Partial<Record<DeckId, number>> = {}; // trackId en cours de chargement
   private deckGenre: Partial<Record<DeckId, Genre>> = {};
   private readySince: Partial<Record<DeckId, number>> = {};
+  /** Début du silence en ms MURALES (l'horloge audio s'arrête si le contexte est suspendu). */
   private silentSince?: number;
   private lastGuestPoll = -Infinity;
   private guestStatus: ConductorSnapshot['guest'];
   private seenRequests = new Set<string>();
   private failedTracks = new Set<number>();
+  private deadDecks = new Set<DeckId>();
+  private lowSince: Partial<Record<DeckId, number>> = {};
+  private lastReconnect: Partial<Record<DeckId, number>> = {};
+  private reconnecting = new Set<DeckId>();
+  private abortedPlanId?: string;
+  private polling = false;
+  private lastPrune = 0;
   private pendingStops = new Set<DeckId>();
   private playedRequests = new Set<string>();
   private emergencyAt = -Infinity;
@@ -398,6 +419,65 @@ export class Conductor {
   }
 
   // ------------------------------------------------------------------------------- lecture d'état
+
+  /** Cache des analyses limité (~200, le plus ancien sort d'abord ; morceaux en jeu protégés). */
+  private rememberAnalysis(id: number, a: TrackAnalysis): void {
+    this.analyses.delete(id);
+    this.analyses.set(id, a);
+    if (this.analyses.size <= ANALYSIS_CACHE) return;
+    const keep = this.protectedIds();
+    for (const k of this.analyses.keys()) {
+      if (this.analyses.size <= ANALYSIS_CACHE) break;
+      if (!keep.has(k)) this.analyses.delete(k);
+    }
+  }
+
+  /** Morceaux à ne pas oublier : platines, file, candidats. */
+  private protectedIds(): Set<number> {
+    const keep = new Set<number>();
+    for (const d of DECK_IDS) {
+      const t = this.d.decks[d].getState().track;
+      if (t) keep.add(t.id);
+    }
+    for (const q of this.queue) keep.add(q.track.id);
+    for (const k of this.candidates.keys()) keep.add(k);
+    return keep;
+  }
+
+  /** Mémoire sur une longue soirée : formes d'onde et structures des platines + 5 derniers morceaux. */
+  private prune(nowMs: number): void {
+    if (nowMs - this.lastPrune < 10_000) return;
+    this.lastPrune = nowMs;
+    const keep = new Set<number>();
+    for (const d of DECK_IDS) {
+      const t = this.d.decks[d].getState().track;
+      if (t) keep.add(t.id);
+      const j = this.scans[d];
+      if (j) keep.add(j.trackId);
+    }
+    for (const h of this.history.slice(-5)) keep.add(h.track.id);
+    for (const k of [...this.waveforms.keys()]) if (!keep.has(k)) this.waveforms.delete(k);
+    for (const k of [...this.structures.keys()]) if (!keep.has(k) && !this.analyses.has(k)) this.structures.delete(k);
+    if (this.analysisFailed.size > 500) this.analysisFailed.clear();
+  }
+
+  /** Nombre d'analyses gardées (tests). */
+  cacheSizes(): { analyses: number; waveforms: number } {
+    return { analyses: this.analyses.size, waveforms: this.waveforms.size };
+  }
+
+  /** Marque une platine HS (capture refusée au lancement, son perdu) : la soirée continue sur l'autre. */
+  markDead(id: DeckId, why: string): void {
+    if (this.deadDecks.has(id)) return;
+    this.deadDecks.add(id);
+    this.lastReconnect[id] = this.d.nowMs();
+    this.log('error', `Platine ${id} hors service : ${why}`);
+    this.emit();
+  }
+
+  isDead(id: DeckId): boolean {
+    return this.deadDecks.has(id);
+  }
 
   getAnalysis(id: number): TrackAnalysis | undefined {
     const a = this.analyses.get(id) ?? this.d.cachedAnalysis?.(id);
@@ -534,6 +614,7 @@ export class Conductor {
         DECK_IDS.filter((d) => this.scans[d]).map((d) => [d, { trackId: this.scans[d]!.trackId, coverage: this.scans[d]!.scanner.coverage() }]),
       ) as ConductorSnapshot['scans'],
       skipRequestedAt: this.skipRequestedAt,
+      deadDecks: [...this.deadDecks],
     };
   }
 
@@ -568,9 +649,11 @@ export class Conductor {
         if (this.autopilot) {
           const decisions = this.callBrain(now, nowMs, states);
           for (const dec of decisions) this.execute(dec, now);
+          this.checkHealth(nowMs, this.deckStates());
           this.watchdog(now, nowMs, this.deckStates());
         }
-        if (nowMs - this.lastGuestPoll >= (this.d.guestPollMs ?? 3000)) {
+        this.prune(nowMs);
+        if (!this.polling && nowMs - this.lastGuestPoll >= (this.d.guestPollMs ?? 3000)) {
           this.lastGuestPoll = nowMs;
           void this.pollGuests();
         }
@@ -595,10 +678,13 @@ export class Conductor {
       history: this.history,
       activeTransition: this.tr?.plan,
       skipRequestedAt: this.skipRequestedAt,
+      deadDecks: this.deadDecks.size ? [...this.deadDecks] : undefined,
+      abortedPlanId: this.abortedPlanId,
     };
-    // toutes les analyses connues (file, candidats, platines) : le cerveau juge ainsi les re-edits avant chargement
+    this.abortedPlanId = undefined; // transmis une seule fois
+    // analyses des candidats, de la file et des platines seulement (pas tout le cache)
     const analyses: Record<number, TrackAnalysis> = {};
-    for (const [id, a] of this.analyses) analyses[id] = a;
+    for (const c of input.candidates) if (c.analysis) analyses[c.track.id] = c.analysis;
     for (const q of this.queue) {
       const a = this.getAnalysis(q.track.id);
       if (a) analyses[q.track.id] = a;
@@ -607,7 +693,7 @@ export class Conductor {
       const a = decks[id].analysis;
       if (a) analyses[a.trackId] = a;
     }
-    (input as BrainInput & { analyses?: Record<number, TrackAnalysis> }).analyses = analyses;
+    input.analyses = analyses;
     try {
       return this.d.brain.tick(input) ?? [];
     } catch (e) {
@@ -640,6 +726,10 @@ export class Conductor {
       case 'load':
         if (this.tr && this.tr.phase === 'scheduled') {
           this.cancelTransition('nouveau morceau choisi, transition replanifiée');
+        }
+        if (this.deadDecks.has(dec.deck)) {
+          this.log('warn', `Chargement ignoré sur ${dec.deck} : platine hors service.`);
+          break;
         }
         if (this.tr && this.tr.plan.from === dec.deck && this.tr.phase !== 'relaxing') {
           this.log('warn', `Chargement ignoré sur ${dec.deck} : elle joue encore la sortie.`);
@@ -866,7 +956,7 @@ export class Conductor {
       if (st) {
         this.structures.set(job.trackId, st);
         const a = this.analyses.get(job.trackId);
-        if (a) this.analyses.set(job.trackId, { ...a, structure: st });
+        if (a) this.rememberAnalysis(job.trackId, { ...a, structure: st });
       }
     } catch {
       /* scan trop court pour conclure */
@@ -939,15 +1029,21 @@ export class Conductor {
   }
 
   private pumpAnalysis(): void {
-    const max = this.d.maxAnalysisConcurrency ?? 2;
+    // pendant une transition : une analyse à la fois (le fil principal reste libre pour le mix)
+    const max = this.tr ? 1 : this.d.maxAnalysisConcurrency ?? 2;
     while (this.analysisInflight.size < max && this.analysisQueue.length) {
       const t = this.analysisQueue.shift()!;
       if (this.getAnalysis(t.id)) continue;
       this.analysisInflight.add(t.id);
-      this.d
-        .analyze(t)
+      const limit = this.d.analysisTimeoutMs ?? 25_000;
+      let timer: unknown;
+      const timeout = new Promise<never>((_, rej) => {
+        timer = setTimeout(() => rej(new Error('analyse trop longue, abandonnée')), limit);
+      });
+      Promise.race([this.d.analyze(t), timeout])
+        .finally(() => clearTimeout(timer as ReturnType<typeof setTimeout>))
         .then((a) => {
-          this.analyses.set(t.id, a);
+          this.rememberAnalysis(t.id, a);
           const c = this.candidates.get(t.id);
           if (c) c.analysis = a;
         })
@@ -1194,6 +1290,7 @@ export class Conductor {
     const now = this.d.nowCtx();
     const p = tr.plan;
     this.log('error', `Platine ${p.to} : ${why}. Transition abandonnée, morceau de secours.`);
+    this.abortedPlanId = p.id;
     try {
       this.d.mixer.cancelFrom(now);
     } catch {
@@ -1255,6 +1352,7 @@ export class Conductor {
     }
     this.activeFx = [];
     this.tr = undefined;
+    if (why !== 'transition mise à jour') this.abortedPlanId = tr.plan.id;
     if (!quiet) this.log('info', `Transition annulée : ${why}.`);
   }
 
@@ -1434,6 +1532,7 @@ export class Conductor {
       this.silentSince = undefined;
       return;
     }
+    void now;
     // platine à l'antenne tombée en erreur ou finie : réaction immédiate
     const crashed = DECK_IDS.some(
       (id) =>
@@ -1441,19 +1540,19 @@ export class Conductor {
         !this.d.mixer.isLooping?.(id) &&
         safeParam(this.d.mixer, `${id}.gain` as ParamTarget, 0) > 0.5,
     );
-    this.silentSince ??= now;
-    const silentFor = now - this.silentSince;
+    this.silentSince ??= nowMs;
+    const silentFor = (nowMs - this.silentSince) / 1000;
     const firstStart = this.history.length === 0;
     // au démarrage, le cerveau ouvre lui-même (transition 'cut') : on ne relance qu'en secours
     const limit = crashed ? 0 : firstStart ? 6 : SILENCE_LIMIT;
     if (silentFor < limit) return;
-    if (now - this.emergencyAt < 2) return;
-    this.emergencyAt = now;
+    if (nowMs - this.emergencyAt < 2000) return;
+    this.emergencyAt = nowMs;
 
     // une platine prête ? on la lance plein pot
     const ready = DECK_IDS.filter((id) => {
       const s = states[id];
-      return s.track && (s.status === 'ready' || s.status === 'paused') && this.readySince[id] !== undefined;
+      return !this.deadDecks.has(id) && s.track && (s.status === 'ready' || s.status === 'paused') && this.readySince[id] !== undefined;
     });
     if (ready.length) {
       const id = ready[0];
@@ -1468,7 +1567,7 @@ export class Conductor {
     }
     if (this.loading.A !== undefined || this.loading.B !== undefined) return;
     // rien de prêt : morceau de secours sur une platine saine
-    const deck = DECK_IDS.find((id) => states[id].status !== 'error') ?? 'A';
+    const deck = DECK_IDS.find((id) => states[id].status !== 'error' && !this.deadDecks.has(id)) ?? DECK_IDS.find((id) => !this.deadDecks.has(id)) ?? 'A';
     void this.pickFallback().then((t) => {
       if (!t) {
         this.log('error', 'Aucun morceau de secours disponible.');
@@ -1478,7 +1577,78 @@ export class Conductor {
       this.queue = this.queue.filter((q) => q.track.id !== t.id);
       void this.loadDeck(deck, t, 0, 'secours');
     });
-    void nowMs;
+  }
+
+  /**
+   * Platine muette prise pour « à l'antenne » : niveau capté nul plus de 5 s fader ouvert, capture
+   * terminée, ou plus aucun état de l'onglet depuis 4 s. On la déclare HS, on bascule sur l'autre,
+   * et on retente la capture toutes les 10 s.
+   */
+  private checkHealth(nowMs: number, states: Record<DeckId, DeckState>): void {
+    let levels: Record<string, number> = {};
+    try {
+      levels = this.d.mixer.getLevels() as Record<string, number>;
+    } catch {
+      /* rien */
+    }
+    for (const id of DECK_IDS) {
+      const st = states[id];
+      const h = this.d.deckHealth?.(id) ?? {};
+      const live = st.status === 'playing' && !this.scans[id] && safeParam(this.d.mixer, `${id}.gain` as ParamTarget, 0) > 0.3;
+      if (live && (levels[id] ?? 1) < DEAD_LEVEL) this.lowSince[id] ??= nowMs;
+      else this.lowSince[id] = undefined;
+      if (this.deadDecks.has(id)) {
+        if (!this.reconnecting.has(id) && nowMs - (this.lastReconnect[id] ?? 0) >= RECONNECT_EVERY_MS && this.d.reconnect) {
+          this.lastReconnect[id] = nowMs;
+          this.reconnecting.add(id);
+          void this.d
+            .reconnect(id)
+            .then((ok) => {
+              if (ok && this.deadDecks.delete(id)) this.log('info', `Platine ${id} : le son est revenu.`);
+            })
+            .catch(() => {})
+            .finally(() => this.reconnecting.delete(id));
+        }
+        continue;
+      }
+      let why: string | undefined;
+      if (h.streamEnded) why = 'la capture du son s’est arrêtée';
+      else if (live && this.lowSince[id] !== undefined && nowMs - this.lowSince[id]! > DEAD_SILENCE_MS) why = 'elle joue mais aucun son n’arrive depuis 5 s';
+      else if (st.status === 'playing' && h.lastStateMs !== undefined && nowMs - h.lastStateMs > STALE_STATE_MS) why = 'l’onglet Deezer ne répond plus';
+      if (!why) continue;
+      const wasOnAir = live;
+      this.markDead(id, why);
+      this.lowSince[id] = undefined;
+      if (wasOnAir) this.failOver(id, states);
+    }
+  }
+
+  /** La platine à l'antenne est HS : l'autre prend le relais (morceau de secours au besoin). */
+  private failOver(dead: DeckId, states: Record<DeckId, DeckState>): void {
+    const o = other(dead);
+    if (this.tr) this.cancelTransition('platine hors service', true);
+    if (this.deadDecks.has(o)) return;
+    const s = states[o];
+    safeSet(this.d.mixer, `${dead}.gain` as ParamTarget, 0);
+    if (s.status === 'playing' && !this.scans[o]) {
+      safeSet(this.d.mixer, `${o}.gain` as ParamTarget, 1);
+      this.log('warn', `La platine ${o} prend l’antenne.`);
+      return;
+    }
+    if (s.track && (s.status === 'ready' || s.status === 'paused')) {
+      this.stopScan(o, 'relais');
+      safeSet(this.d.mixer, `${o}.gain` as ParamTarget, 1);
+      void this.d.decks[o].play().catch(() => {});
+      this.markStarted(o);
+      this.log('warn', `La platine ${o} prend le relais.`);
+      return;
+    }
+    void this.pickFallback().then((t) => {
+      if (t) {
+        this.log('warn', `Morceau de secours « ${t.title} » sur ${o}.`);
+        void this.loadDeck(o, t, 0, 'secours');
+      }
+    });
   }
 
   private async pickFallback(): Promise<TrackRef | undefined> {
@@ -1551,7 +1721,16 @@ export class Conductor {
 
   async pollGuests(): Promise<void> {
     const api = this.d.guestApi;
-    if (!api) return;
+    if (!api || this.polling) return;
+    this.polling = true; // jamais deux sondages en même temps
+    try {
+      await this.pollGuestsOnce(api);
+    } finally {
+      this.polling = false;
+    }
+  }
+
+  private async pollGuestsOnce(api: GuestApiLike): Promise<void> {
     try {
       const st = await api.getState();
       this.crowd = st.crowd ?? this.crowd;
@@ -1571,7 +1750,7 @@ export class Conductor {
       const air = this.onAir(states);
       const np: NowPlaying = {
         current: air ? states[air].track : undefined,
-        next: air ? states[other(air)].track ?? this.queue[0]?.track : this.queue[0]?.track,
+        next: this.nextForGuests(states, air),
         genre: (air && this.deckGenre[air]) || this.currentGenre,
         updatedAt: this.d.nowMs(),
       };
@@ -1580,6 +1759,17 @@ export class Conductor {
     } catch (e) {
       this.guestStatus = { ...this.guestStatus, ok: false, lastError: errMsg(e) };
     }
+  }
+
+  /** « À suivre » pour les invités : la platine prête/en chargement si son morceau est neuf, sinon la file. */
+  nextForGuests(states: Record<DeckId, DeckState>, air: DeckId | null): TrackRef | undefined {
+    if (air) {
+      const o = states[other(air)];
+      const recent = new Set(this.history.slice(-20).map((h) => h.track.id));
+      const ok = (o.status === 'ready' || o.status === 'loading' || this.loading[o.id] !== undefined) && o.track && !recent.has(o.track.id);
+      if (ok) return o.track;
+    }
+    return this.queue[0]?.track;
   }
 
   // ------------------------------------------------------------------------------- divers

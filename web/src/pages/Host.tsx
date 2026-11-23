@@ -113,6 +113,11 @@ function Dashboard({ hostKey, onLogout }: { hostKey: string; onLogout: () => voi
       />
 
       {offline ? <div className="banner banner--off"><strong>Hors ligne.</strong> L'API ne répond pas. On réessaie toutes les 5 secondes.</div> : null}
+      {state?.storage === 'memory' ? (
+        <div className="banner banner--warn">
+          <strong>Base de données non branchée :</strong> les votes peuvent se perdre. Ajoute Upstash Redis au projet Vercel.
+        </div>
+      ) : null}
       {unauthorized ? (
         <div className="banner banner--off">
           <strong>Accès refusé.</strong> {authError!.message} <button type="button" className="link" onClick={onLogout}>Changer de clé</button>

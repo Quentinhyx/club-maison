@@ -6,7 +6,7 @@ import { guard, jsonBody, partyOf, prelude, requireHost, sendError, sendResult }
  *  Un corps vide {} sert à vérifier la clé et lire les réglages. forcedGenre: null efface le genre forcé. */
 const run = guard(async (req, res, store) => {
   if (!prelude(req, res, 'POST')) return;
-  if (!requireHost(req, res)) return;
+  if (!(await requireHost(req, res, store))) return;
   const body = jsonBody(req) ?? (req.body == null || req.body === '' ? {} : null);
   if (!body) return sendError(res, 400, 'invalid', 'Corps JSON attendu.');
   sendResult(res, await hostUpdateSettings(store, partyOf(req), body));

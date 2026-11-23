@@ -144,6 +144,9 @@ interface SimOptions {
   structureDelay?: number;
   /** Une partie des candidats vient de la radio de l'artiste en cours ('similar'). */
   similar?: boolean;
+  /** Platines hors service ; abandon de la première transition après N minutes. */
+  deadDecks?: DeckId[];
+  abortAt?: number;
   minPlay?: number;
   maxPlay?: number;
 }
@@ -189,6 +192,9 @@ class Sim {
   withSimilar: boolean;
   skipAt?: number;
   loopOffGrid = 0;
+  deadDecks?: DeckId[];
+  abortAt?: number;
+  abortedId?: string;
 
   constructor(o: SimOptions = {}) {
     this.brain = createBrain({ random: o.random ?? mulberry32(o.seed ?? 42) });
@@ -199,6 +205,8 @@ class Sim {
     this.withStructure = !!o.structure;
     this.structureDelay = o.structureDelay ?? 0;
     this.withSimilar = !!o.similar;
+    this.deadDecks = o.deadDecks;
+    this.abortAt = o.abortAt;
     this.loadLatency = o.loadLatency ?? 1.5;
     this.settings = {
       ...DEFAULT_SETTINGS, style: o.style ?? 'paris-tech-house', fxAmount: o.fxAmount ?? 0.5,
@@ -267,7 +275,7 @@ class Sim {
       nowCtx: this.nowCtx, nowMs: this.nowMs,
       decks: { A: this.deckState(this.decks.A), B: this.deckState(this.decks.B) },
       queue: this.queue.map((q) => ({ ...q })), candidates: this.candidates(), crowd: this.crowd, settings: this.settings,
-      history: this.history.slice(), activeTransition: this.active, skipRequestedAt: this.skipAt,
+      history: this.history.slice(), activeTransition: this.active, skipRequestedAt: this.skipAt, abortedPlanId: this.abortedId, deadDecks: this.deadDecks,
       // résultats d'analyse des sons de la file (champ optionnel BrainInputExtras)
       analyses: Object.fromEntries(this.queue.filter((q) => this.analyzed.has(q.track.id) && CATALOGUE.has(q.track.id)).map((q) => [q.track.id, this.analysisOf(q.track.id)!])),
     };
@@ -287,7 +295,9 @@ class Sim {
         case 'analyze': this.analyzed.add(d.track.id); break;
         case 'load': {
           const deck = this.decks[d.deck];
-          if (deck.status === 'playing') this.violations.push(`load sur une platine qui joue (${d.deck})`);
+          if (this.deadDecks?.includes(d.deck)) this.violations.push(`load vers la platine HS ${d.deck}`);
+          const single = !!this.deadDecks?.includes(d.deck === 'A' ? 'B' : 'A');
+          if (deck.status === 'playing' && !single) this.violations.push(`load sur une platine qui joue (${d.deck})`);
           const g = this.genreOf(d.track);
           if (g && this.crowd.host.blockedGenres.includes(g)) this.violations.push(`load d'un genre bloqué ${g}`);
           this.loads.push({ now: this.nowCtx, deck: d.deck, track: d.track, startAt: d.startAt });
@@ -311,6 +321,11 @@ class Sim {
             r.plan = plan;
             r.endCtx = this.activeEnd;
             r.shortened = true;
+            break;
+          }
+          if (this.deadDecks?.includes(plan.to)) this.violations.push(`transition vers la platine HS ${plan.to}`);
+          if (this.abortAt !== undefined && !this.abortedId && this.minutes() >= this.abortAt && this.decks[plan.from].status === 'playing') {
+            this.abortedId = plan.id; // le chef d'orchestre abandonne : l'entrant ne démarre jamais
             break;
           }
           if (this.active) this.violations.push(`transition ${plan.id} pendant ${this.active.id}`);
@@ -1207,6 +1222,29 @@ test('sons d’ambiance : parcimonie, jamais en lounge ni si désactivés', () =
   off.settings.stingers = false;
   off.runFor(30 * 60);
   assert.equal(stingers(off).length, 0, 'aucun si stingers false');
+});
+
+test('transition abandonnée par la table : replanification sans blanc', () => {
+  const sim = new Sim({ seed: 91, abortAt: 4 });
+  sim.runFor(25 * 60);
+  assert.ok(sim.abortedId, 'une transition abandonnée');
+  assert.ok(sim.logs.some((l) => /abandonnée par la table/.test(l)), 'journalisé');
+  assert.ok(!sim.transitions.some((t) => t.plan.id === sim.abortedId));
+  checkInvariants(sim, 'abandon');
+  assert.ok(sim.played().length >= 4, `la soirée continue (${sim.played().length})`);
+});
+
+test('platine B hors service : tout continue sur A', () => {
+  const sim = new Sim({ seed: 92, style: 'soiree', maxPlay: 180, deadDecks: ['B'] });
+  sim.runFor(15 * 60);
+  assert.deepEqual(sim.violations, [], 'aucune décision vers B');
+  assert.ok(!sim.loads.some((l) => l.deck === 'B') && !sim.transitions.some((t) => t.plan.to === 'B' || t.plan.from === 'B'));
+  assert.ok(sim.played().length >= 4, `morceaux joués (${sim.played().length})`);
+  const ids = sim.played().map((t) => t.id);
+  assert.equal(new Set(ids).size, ids.length);
+  assert.ok(sim.logs.some((l) => /Une seule platine disponible/.test(l)));
+  assert.ok(sim.silence < 3 * sim.transitions.length, `blancs courts (${sim.silence.toFixed(1)} s)`);
+  for (const t of sim.transitions.slice(1)) assert.ok(t.plan.technique === 'cut' && t.plan.from === 'A' && t.plan.to === 'A');
 });
 
 // --------------------------------------------------------------------------------------------- soirée de 2 h

@@ -4,8 +4,8 @@
   "outputDirectory": "dist",
   "rewrites": [
     {
-      "source": "/dz-api/:path*",
-      "destination": "https://api.deezer.com/:path*"
+      "source": "/dz-api/:root(search|track|artist|chart|playlist|radio)/:rest*",
+      "destination": "https://api.deezer.com/:root/:rest*"
     },
     {
       "source": "/dz-cdn/:host/:path*",
