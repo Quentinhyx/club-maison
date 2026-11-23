@@ -7,6 +7,7 @@ import type { ConductorSnapshot } from '../conductor';
 import { Engine, MODE_LABELS } from '../engine';
 import { isExtension, urlParam } from '../lib/env';
 import { saveSettings, type ConsoleSettings } from '../lib/storage';
+import { GuestApi } from '../lib/guestApi';
 import { BottomTabs } from './BottomTabs';
 import { DeckPanel } from './DeckPanel';
 import { getFrame, useFrame } from './frame';
@@ -58,11 +59,47 @@ export function App({ initial }: { initial: ConsoleSettings }) {
   };
 
   const onSave = (s: ConsoleSettings, restart: boolean) => {
+    const prev = settings;
     setSettings(s);
     void saveSettings(s).then(() => {
-      if (restart) location.reload();
+      if (!restart) return;
+      // à chaud : API des invités
+      if (s.apiUrl !== prev.apiUrl || s.hostKey !== prev.hostKey || s.party !== prev.party) {
+        engine.conductor.setGuestApi(s.apiUrl ? new GuestApi(s.apiUrl, s.hostKey, s.party) : null);
+        engine.conductor.log('info', 'Réglages des invités appliqués.');
+      }
+      // la source des platines ne se change pas à chaud : il faut recharger la console
+      const sourceChanged = s.deckMode !== engine.mode || s.captureMode !== prev.captureMode;
+      if (sourceChanged) {
+        const ok =
+          !engine.conductor.isRunning() ||
+          window.confirm('Changer la source des platines arrête la musique et recharge la console. Continuer ?');
+        if (ok) {
+          leaving.current = true;
+          location.reload();
+        }
+      }
     });
   };
+
+  // pas de fermeture accidentelle pendant la soirée
+  const leaving = useRef(false);
+  useEffect(() => {
+    const onBefore = (e: BeforeUnloadEvent) => {
+      if (engine.conductor.isRunning() && !leaving.current) {
+        e.preventDefault();
+        e.returnValue = '';
+      }
+    };
+    window.addEventListener('beforeunload', onBefore);
+    return () => window.removeEventListener('beforeunload', onBefore);
+  }, [engine]);
+
+  // état du son (veille, enceinte) et platines sans son : bandeaux
+  const [, force] = useState(0);
+  useEffect(() => engine.onStatus(() => force((x) => x + 1)), [engine]);
+  const audioPaused = running && engine.audioState() !== 'running';
+  const deadBanner = (['A', 'B'] as DeckId[]).filter((d) => snap.deadDecks.includes(d));
 
   const loadNext = (id: DeckId) => {
     const it = snap.queue[0];
@@ -115,6 +152,23 @@ export function App({ initial }: { initial: ConsoleSettings }) {
         </div>
       </header>
 
+      {audioPaused && (
+        <button className="banner banner-big" onClick={() => void engine.resumeAudio()}>
+          Le son est en pause (veille ou enceinte débranchée) : clique ici pour relancer
+        </button>
+      )}
+      {deadBanner.map((d) => (
+        <div className="banner" key={d}>
+          <span>
+            Platine {d} sans son :{' '}
+            {engine.mode === 'deezer'
+              ? `clique sur l’icône Club Maison dans l’onglet Deezer ${d === 'B' ? 'privé' : 'normal'}, puis sur Reconnecter.`
+              : 'la soirée continue sur l’autre platine.'}{' '}
+            La soirée continue sur l’autre platine.
+          </span>
+          <button onClick={() => void engine.reconnect(d)}>Reconnecter</button>
+        </div>
+      ))}
       <WaveDisplay engine={engine} />
       <TransitionBar engine={engine} running={running} />
 

@@ -219,7 +219,10 @@ function GuestsTab({ engine, snap, settings }: Props) {
       <div className="g-col">
         <div className="g-head">
           Public{' '}
-          <span className={`pill ${snap.guest.ok ? 'ok' : 'ko'}`}>{snap.guest.ok ? 'API connectée' : snap.guest.lastError ? 'API injoignable' : 'connexion…'}</span>
+          <span className={`pill ${snap.guest.ok ? 'ok' : 'ko'}`}>{snap.guest.ok ? 'API connectée' : snap.guest.lastError ? 'API en erreur' : 'connexion…'}</span>
+        </div>
+        {!snap.guest.ok && snap.guest.lastError && <div className="g-err">{snap.guest.lastError}</div>}
+        <div className="g-head" style={{ display: 'none' }}>
         </div>
         <div className="energy">
           <span className="lbl">ÉNERGIE DEMANDÉE</span>
@@ -287,6 +290,20 @@ function SettingsTab({ engine, settings, onSaveSettings }: Props) {
     onSaveSettings(ns, false);
   };
   const modeChanged = s.deckMode !== engine.mode || s.captureMode !== settings.captureMode;
+  // durées validées à la sortie du champ : min >= 30 s, max >= min + 15 s
+  const [minTxt, setMinTxt] = useState(String(dj.minPlaySeconds));
+  const [maxTxt, setMaxTxt] = useState(String(dj.maxPlaySeconds));
+  const commitDurations = () => {
+    let mn = Math.round(Number(minTxt));
+    let mx = Math.round(Number(maxTxt));
+    if (!Number.isFinite(mn)) mn = dj.minPlaySeconds;
+    if (!Number.isFinite(mx)) mx = dj.maxPlaySeconds;
+    mn = Math.min(600, Math.max(30, mn));
+    mx = Math.min(900, Math.max(mn + 15, mx));
+    setMinTxt(String(mn));
+    setMaxTxt(String(mx));
+    if (mn !== dj.minPlaySeconds || mx !== dj.maxPlaySeconds) upd({ minPlaySeconds: mn, maxPlaySeconds: mx });
+  };
   return (
     <div className="settings">
       <div className="s-col">
@@ -309,11 +326,11 @@ function SettingsTab({ engine, settings, onSaveSettings }: Props) {
         <div className="row2">
           <label>
             Durée min (s)
-            <input type="number" min={30} max={600} value={dj.minPlaySeconds} onChange={(e) => upd({ minPlaySeconds: Number(e.target.value) })} />
+            <input type="number" min={30} max={600} value={minTxt} onChange={(e) => setMinTxt(e.target.value)} onBlur={commitDurations} />
           </label>
           <label>
             Durée max (s)
-            <input type="number" min={45} max={900} value={dj.maxPlaySeconds} onChange={(e) => upd({ maxPlaySeconds: Number(e.target.value) })} />
+            <input type="number" min={45} max={900} value={maxTxt} onChange={(e) => setMaxTxt(e.target.value)} onBlur={commitDurations} />
           </label>
         </div>
         <label className="check">

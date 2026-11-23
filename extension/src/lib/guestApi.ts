@@ -26,19 +26,30 @@ export class GuestApi implements GuestApiLike {
     return `${this.base}${path}${sep}party=${encodeURIComponent(this.party)}`;
   }
 
+  /** fetch avec délai de 8 s et messages d'erreur lisibles. */
+  private async call(path: string, init: RequestInit): Promise<Response> {
+    let res: Response;
+    try {
+      res = await this.fetcher(this.url(path), { ...init, signal: timeoutSignal(8000) });
+    } catch (e) {
+      const name = (e as Error)?.name;
+      throw new Error(name === 'TimeoutError' || name === 'AbortError' ? 'API invités : pas de réponse (8 s)' : 'API invités injoignable (réseau)');
+    }
+    if (!res.ok) throw new Error(apiErrorMessage(res.status));
+    return res;
+  }
+
   private async post(path: string, body: unknown): Promise<any> {
-    const res = await this.fetcher(this.url(path), {
+    const res = await this.call(path, {
       method: 'POST',
       headers: { 'content-type': 'application/json', 'x-host-key': this.hostKey },
       body: JSON.stringify(body),
     });
-    if (!res.ok) throw new Error(`API invités : HTTP ${res.status} sur ${path}`);
     return res.json().catch(() => null);
   }
 
   async getState(): Promise<PartyState> {
-    const res = await this.fetcher(this.url('/api/state'), { headers: { accept: 'application/json' } });
-    if (!res.ok) throw new Error(`API invités : HTTP ${res.status}`);
+    const res = await this.call('/api/state', { headers: { accept: 'application/json' } });
     return (await res.json()) as PartyState;
   }
 
@@ -53,6 +64,19 @@ export class GuestApi implements GuestApiLike {
   async setHostSettings(s: Partial<HostSettings>): Promise<void> {
     await this.post('/api/host/settings', s);
   }
+}
+
+function timeoutSignal(ms: number): AbortSignal | undefined {
+  return typeof AbortSignal !== 'undefined' && typeof AbortSignal.timeout === 'function' ? AbortSignal.timeout(ms) : undefined;
+}
+
+/** Message affiché dans l'onglet Invités selon le code HTTP. */
+export function apiErrorMessage(status: number): string {
+  if (status === 401 || status === 403) return 'Clé hôte refusée : vérifie la clé dans Réglages.';
+  if (status === 503) return 'HOST_KEY manquante sur Vercel : ajoute la variable d’environnement puis redéploie.';
+  if (status === 404) return 'API invités introuvable : vérifie l’adresse dans Réglages.';
+  if (status >= 500) return `API invités en panne (HTTP ${status}).`;
+  return `API invités : HTTP ${status}.`;
 }
 
 export function qrPageUrl(apiUrl: string, party: string): string {

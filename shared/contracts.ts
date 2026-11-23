@@ -330,6 +330,8 @@ export interface NowPlaying {
 export interface PartyState {
   crowd: CrowdState;
   nowPlaying: NowPlaying;
+  /** Stockage de l'API : 'memory' = Upstash non branché, les votes peuvent se perdre. */
+  storage?: 'redis' | 'memory';
 }
 
 /**

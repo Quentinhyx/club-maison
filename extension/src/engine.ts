@@ -133,6 +133,11 @@ export class Engine {
               capture: (id, onFrame) => this.capturePcm(id, onFrame),
             }
           : undefined,
+      deckHealth: (id) => {
+        const d = this.decks[id];
+        return d instanceof DeezerDeck ? d.health() : {};
+      },
+      reconnect: (id) => this.reconnect(id),
       reportLatency: (id, s2) => {
         const d = this.decks[id];
         if (d instanceof DeezerDeck) d.recordLatency(s2);
@@ -147,6 +152,28 @@ export class Engine {
       });
     }
     this.waves.external = (id) => this.conductor.getWaveform(id);
+    // veille, enceinte débranchée : le contexte audio passe en pause -> on tente de relancer
+    this.ctx.onstatechange = () => {
+      const st = this.ctx.state as string;
+      if ((st === 'suspended' || st === 'interrupted') && this.conductor.isRunning()) {
+        this.conductor.log('warn', 'Le son est en pause (veille ou sortie audio perdue) : tentative de relance.');
+        void this.ctx.resume().catch(() => {});
+      }
+      this.emitStatus();
+    };
+    if (this.mode === 'deezer') {
+      // un onglet de platine revient (rechargement, nouvel onglet) : on rebranche sa capture
+      let prev: Partial<Record<DeckId, number>> = {};
+      getBridge().onTabs((_tabs, asg) => {
+        for (const id of DECK_IDS) {
+          const t = asg[id];
+          if (t !== undefined && (t !== prev[id] || this.conductor.isDead(id) || this.connectErrors[id]) && this.conductor.isRunning()) {
+            void this.reconnect(id);
+          }
+        }
+        prev = { ...asg };
+      });
+    }
     for (const id of DECK_IDS) {
       this.decks[id].on((e) => {
         if (e.type === 'track' && e.track) void this.waves.prepare(id, e.track);
@@ -194,8 +221,9 @@ export class Engine {
   }
 
   /** Branche le son des platines sur la table (à refaire si un onglet Deezer change). */
-  async connectDecks(): Promise<void> {
+  async connectDecks(only?: DeckId): Promise<void> {
     for (const id of DECK_IDS) {
+      if (only && id !== only) continue;
       if (this.connected[id]) continue;
       try {
         const src = await this.decks[id].getStream();
@@ -204,9 +232,56 @@ export class Engine {
         delete this.connectErrors[id];
       } catch (e) {
         this.connectErrors[id] = e instanceof Error ? e.message : String(e);
-        this.conductor.log('error', `Son de la platine ${id} non capté : ${this.connectErrors[id]}`);
+        // la soirée tourne sur l'autre platine ; un bandeau dit quoi faire
+        this.conductor.markDead(id, `son non capté (${this.connectErrors[id]})`);
       }
+      this.emitStatus();
     }
+  }
+
+  /** Rebranche le son d'une platine (bouton « Reconnecter », retour d'un onglet, platine HS). */
+  private reconnectAt: Partial<Record<DeckId, number>> = {};
+  private reconnectBusy = new Set<DeckId>();
+
+  async reconnect(id: DeckId): Promise<boolean> {
+    if (this.reconnectBusy.has(id) || Date.now() - (this.reconnectAt[id] ?? 0) < 3000) return this.connected[id];
+    this.reconnectBusy.add(id);
+    this.reconnectAt[id] = Date.now();
+    try {
+      return await this.reconnectNow(id);
+    } finally {
+      this.reconnectBusy.delete(id);
+    }
+  }
+
+  private async reconnectNow(id: DeckId): Promise<boolean> {
+    const d = this.decks[id];
+    if (d instanceof DeezerDeck) d.dropStream();
+    this.connected[id] = false;
+    await this.connectDecks(id);
+    return this.connected[id];
+  }
+
+  // ------------------------------------------------------------------ état du son (veille, enceinte)
+  private statusListeners = new Set<() => void>();
+  onStatus(fn: () => void): () => void {
+    this.statusListeners.add(fn);
+    return () => this.statusListeners.delete(fn);
+  }
+  private emitStatus(): void {
+    for (const f of this.statusListeners) f();
+  }
+  /** État du contexte audio : 'running', 'suspended', 'interrupted' (veille, sortie audio perdue)… */
+  audioState(): string {
+    return this.ctx.state as string;
+  }
+  async resumeAudio(): Promise<void> {
+    try {
+      await this.ctx.resume();
+    } catch {
+      /* il faudra un clic */
+    }
+    this.emitStatus();
   }
 
   resetConnection(id: DeckId): void {

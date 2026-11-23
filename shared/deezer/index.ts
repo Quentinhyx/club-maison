@@ -17,6 +17,11 @@ export class DeezerError extends Error {
   }
 }
 
+/** AbortSignal.timeout si disponible (navigateurs récents, Node 18+). */
+function timeoutSignal(ms: number): AbortSignal | undefined {
+  return typeof AbortSignal !== 'undefined' && typeof AbortSignal.timeout === 'function' ? AbortSignal.timeout(ms) : undefined;
+}
+
 const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
 
 /** Codes d'erreur Deezer : 4 = quota dépassé, 700 = service occupé. */
@@ -28,7 +33,8 @@ async function deezerGet(path: string, fetcher: Fetcher = fetch, attempts = 3): 
   for (let i = 0; i < attempts; i++) {
     if (i > 0) await sleep(400 * i + Math.random() * 300);
     try {
-      const res = await fetcher(url, { headers: { Accept: 'application/json' } });
+      // délai de 8 s : un appel bloqué ne doit jamais geler le catalogue
+      const res = await fetcher(url, { headers: { Accept: 'application/json' }, signal: timeoutSignal(8000) });
       if (res.status === 429 || res.status >= 500) {
         lastErr = new DeezerError(res.status, `Deezer HTTP ${res.status}`);
         continue;

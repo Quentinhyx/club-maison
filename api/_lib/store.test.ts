@@ -8,9 +8,12 @@ import {
   addRequest, checkHostKey, ENERGY_COOLDOWN, GENRE_HALF_LIFE, getCrowd, getPartyState, HOUR,
   hostSetNowPlaying, hostSetRequestStatus, hostUpdateSettings, maskGuestId, MINUTE, normalizeParty,
   sanitizeTrack, voteEnergy, voteGenre,
+  clientIp, hostAccess, HOST_FAIL_LIMIT, IP_REQUEST_LIMIT, IP_WRITE_LIMIT, limitRequests, MAX_PENDING_TOTAL,
+  PUBLIC_REQUESTS_MAX, purgeEnergy, rateLimit,
 } from './party.js';
+import { isPreviewHost, previewTarget } from './relay.js';
 import { catalogForGenre, getTrack, searchTracks, similarTracks, toTrackRef } from '../../shared/deezer/index.js';
-import type { TrackRef } from '../../shared/contracts.js';
+import type { GuestRequest, TrackRef } from '../../shared/contracts.js';
 
 let failures = 0;
 let passed = 0;
@@ -372,6 +375,131 @@ await test('« Suivant » depuis le téléphone : skipAt posé à l’heure du s
   const r = await hostUpdateSettings(s, P, { skipAt: 1 });
   assert.ok(r.ok);
   if (r.ok) assert.ok((r.value.skipAt ?? 0) >= before);
+});
+
+
+console.log('garde-fous anti-abus');
+
+await test('limite par IP : écritures et demandes, fenêtre fixe, IP séparées', async () => {
+  const s = new MemoryStore();
+  let now = T0;
+  s.now = () => now;
+  for (let i = 0; i < IP_WRITE_LIMIT; i++) assert.ok((await rateLimit(s, 'write', '1.2.3.4', IP_WRITE_LIMIT, 600)).ok);
+  const over = await rateLimit(s, 'write', '1.2.3.4', IP_WRITE_LIMIT, 600);
+  assert.ok(!over.ok && over.status === 429 && over.code === 'rate-limited' && over.retryAfter === 600);
+  assert.ok((await rateLimit(s, 'write', '5.6.7.8', IP_WRITE_LIMIT, 600)).ok, 'autre IP non touchée');
+  now += 601_000;
+  assert.ok((await rateLimit(s, 'write', '1.2.3.4', IP_WRITE_LIMIT, 600)).ok, 'fenêtre suivante');
+  for (let i = 0; i < IP_REQUEST_LIMIT; i++) assert.ok((await rateLimit(s, 'request', '9.9.9.9', IP_REQUEST_LIMIT, 3600)).ok);
+  const r = await rateLimit(s, 'request', '9.9.9.9', IP_REQUEST_LIMIT, 3600);
+  assert.ok(!r.ok && /demandes/.test(r.message));
+});
+
+await test('clientIp : x-real-ip puis x-forwarded-for, valeurs bizarres ignorées', () => {
+  assert.equal(clientIp({ 'x-real-ip': '1.2.3.4', 'x-forwarded-for': '9.9.9.9' }), '1.2.3.4');
+  assert.equal(clientIp({ 'x-forwarded-for': '9.9.9.9, 10.0.0.1' }), '9.9.9.9');
+  assert.equal(clientIp({ 'x-forwarded-for': '2001:DB8::1' }), '2001:db8::1');
+  assert.equal(clientIp({ 'x-real-ip': '<script>' }), 'unknown');
+  assert.equal(clientIp({}), 'unknown');
+});
+
+await test('plafond global : 50 demandes en attente, puis « File pleine »', async () => {
+  const { s, ids } = fresh();
+  await hostUpdateSettings(s, P, { maxRequestsPerGuest: 20 });
+  for (let i = 0; i < MAX_PENDING_TOTAL; i++) {
+    const r = await addRequest(s, P, { guestId: `guest-${String(i % 5).padStart(6, '0')}`, track: track(1000 + i) }, T0 + i, ids);
+    assert.ok(r.ok, `demande ${i}`);
+  }
+  const full = await addRequest(s, P, { guestId: 'guest-zzzzzz', track: track(5000) }, T0 + 100, ids);
+  assert.ok(!full.ok && full.code === 'queue-full' && /File pleine/.test(full.message));
+  // Une demande acceptée libère une place.
+  await hostSetRequestStatus(s, P, { id: 'req1', status: 'accepted' }, T0 + 101);
+  assert.ok((await addRequest(s, P, { guestId: 'guest-zzzzzz', track: track(5000) }, T0 + 102, ids)).ok);
+});
+
+await test('état public : 30 demandes max, en attente puis acceptées puis récentes', async () => {
+  const mk = (i: number, status: GuestRequest['status']): GuestRequest =>
+    ({ id: `r${i}`, guestId: 'g', track: track(i), createdAt: T0 + i, status });
+  const list = [
+    ...Array.from({ length: 10 }, (_, i) => mk(i, 'played')),
+    ...Array.from({ length: 25 }, (_, i) => mk(100 + i, 'pending')),
+    ...Array.from({ length: 10 }, (_, i) => mk(200 + i, 'accepted')),
+  ];
+  const out = limitRequests(list, PUBLIC_REQUESTS_MAX);
+  assert.equal(out.length, 30);
+  assert.equal(out.filter((r) => r.status === 'pending').length, 25);
+  assert.equal(out.filter((r) => r.status === 'accepted').length, 5);
+  assert.equal(out[0].id, 'r100');
+  assert.deepEqual(limitRequests([mk(1, 'played'), mk(2, 'rejected'), mk(3, 'pending')], 30).map((r) => r.id), ['r3', 'r2', 'r1']);
+
+  const { s, ids } = fresh();
+  await hostUpdateSettings(s, P, { maxRequestsPerGuest: 20 });
+  for (let i = 0; i < 40; i++) await addRequest(s, P, { guestId: `guest-${String(i % 4).padStart(6, '0')}`, track: track(300 + i) }, T0 + i, ids);
+  assert.equal((await getPartyState(s, P, T0 + 100)).crowd.requests.length, 30);
+  assert.equal((await getPartyState(s, P, T0 + 100, { reveal: true })).crowd.requests.length, 40);
+});
+
+await test('anti-force-brute : 5 échecs -> 429 pendant 10 min, même avec la bonne clé', async () => {
+  const s = new MemoryStore();
+  let now = T0;
+  s.now = () => now;
+  const ip = '7.7.7.7';
+  for (let i = 0; i < HOST_FAIL_LIMIT; i++) {
+    const r = await hostAccess(s, ip, 'faux', 'secret');
+    assert.ok(!r.ok && r.status === 401);
+  }
+  const locked = await hostAccess(s, ip, 'secret', 'secret');
+  assert.ok(!locked.ok && locked.status === 429 && locked.code === 'host-locked');
+  assert.ok((await hostAccess(s, '8.8.8.8', 'secret', 'secret')).ok, 'autre IP non bloquée');
+  now += 10 * MINUTE + 1000;
+  assert.ok((await hostAccess(s, ip, 'secret', 'secret')).ok, 'débloqué après 10 min');
+  // Sans HOST_KEY : 503, rien n'est compté.
+  const m = await hostAccess(s, ip, 'x', undefined);
+  assert.ok(!m.ok && m.status === 503);
+  assert.equal(await s.get(`cm:hostfail:${ip}`), null);
+});
+
+await test('écritures concurrentes : même morceau ou même invité en parallèle, un seul passe', async () => {
+  const { s, ids } = fresh();
+  const same = await Promise.all([
+    addRequest(s, P, { guestId: G1, track: track(700) }, T0, ids),
+    addRequest(s, P, { guestId: G2, track: track(700) }, T0, ids),
+    addRequest(s, P, { guestId: G3, track: track(700) }, T0, ids),
+  ]);
+  assert.equal(same.filter((r) => r.ok).length, 1);
+  await hostUpdateSettings(s, P, { maxRequestsPerGuest: 1 });
+  const burst = await Promise.all([701, 702, 703].map((id) => addRequest(s, P, { guestId: G2, track: track(id) }, T0, ids)));
+  assert.equal(burst.filter((r) => r.ok).length, 1);
+  const pending = (await getCrowd(s, P, T0, { reveal: true })).requests.filter((r) => r.guestId === G2);
+  assert.equal(pending.length, 1);
+  const energy = await Promise.all([1, 1, 1].map(() => voteEnergy(s, P, { guestId: G3, vote: 1 as const }, T0)));
+  assert.equal(energy.filter((r) => r.ok).length, 1);
+});
+
+await test('purge du hash énergie', async () => {
+  const { s } = fresh();
+  await voteEnergy(s, P, { guestId: G1, vote: 1 }, T0);
+  await voteEnergy(s, P, { guestId: G2, vote: -1 }, T0 + 3 * HOUR);
+  assert.equal(await purgeEnergy(s, P, T0 + 3 * HOUR), 1);
+  assert.deepEqual(Object.keys(await s.hgetall(`cm:${P}:energy`)), [G2]);
+});
+
+await test('relais : seuls les hôtes d’extraits Deezer passent', () => {
+  for (const h of ['cdns-preview-d.dzcdn.net', 'cdnt-preview.dzcdn.net', 'CDNS-PREVIEW-1.DZCDN.NET', 'cdn-preview-5.dzcdn.net', 'e-cdns-preview-a.dzcdn.net']) {
+    assert.ok(isPreviewHost(h), h);
+  }
+  for (const h of ['e-cdns-images.dzcdn.net', 'evil.com', 'cdns-preview-d.dzcdn.net.evil.com', 'dzcdn.net', 'x.cdnt-preview.dzcdn.net', 'api.deezer.com', '']) {
+    assert.ok(!isPreviewHost(h), h);
+  }
+  assert.equal(previewTarget('cdnt-preview.dzcdn.net', 'api/1/1/a/b/c/0/x.mp3', { host: 'h', path: 'p', hdnea: 'exp=1~acl=/api/1/1/a/*~hmac=ab' }),
+    'https://cdnt-preview.dzcdn.net/api/1/1/a/b/c/0/x.mp3?hdnea=exp%3D1%7Eacl%3D%2Fapi%2F1%2F1%2Fa%2F*%7Ehmac%3Dab');
+  assert.equal(previewTarget('cdnt-preview.dzcdn.net', '../etc/passwd', {}), null);
+  assert.equal(previewTarget('cdnt-preview.dzcdn.net', '', {}), null);
+  assert.equal(previewTarget('cdnt-preview.dzcdn.net', 'a b', {}), null);
+  assert.equal(previewTarget('images.dzcdn.net', 'x.jpg', {}), null);
+  // Les URL d'extraits produites par les tests de shared/deezer passent le filtre.
+  const u = new URL(RAW(1).preview);
+  assert.ok(previewTarget(u.hostname, u.pathname, {}));
 });
 
 console.log(`\n${passed} réussi(s), ${failures} échec(s)`);
