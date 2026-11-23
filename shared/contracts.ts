@@ -398,6 +398,12 @@ export interface BrainInput {
    *  morceau en cours au plus vite (prochaine mesure, transition courte), une seule fois par valeur, et
    *  traite le zappage comme un avis négatif pour ajuster la suite du set. */
   skipRequestedAt?: number;
+  /** Transition que le chef d'orchestre a dû abandonner (entrant jamais démarré, platine HS…) : le
+   *  cerveau oublie ce plan, considère que le sortant joue toujours et replanifie. Une fois par valeur. */
+  abortedPlanId?: string;
+  /** Platines hors service (capture muette, onglet fermé) : le cerveau ne les utilise plus tant qu'elles
+   *  y figurent. */
+  deadDecks?: DeckId[];
   /** Analyses connues (file, candidats, platines), par trackId. */
   analyses?: Record<number, TrackAnalysis>;
 }
