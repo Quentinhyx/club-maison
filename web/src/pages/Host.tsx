@@ -142,6 +142,16 @@ function Dashboard({ hostKey, onLogout }: { hostKey: string; onLogout: () => voi
           <p className="empty">{loading ? 'Chargement…' : "L'extension n'a encore rien publié."}</p>
         )}
         {np?.next ? <div className="now__next"><span className="label">Ensuite</span><TrackLine track={np.next} size={40} /></div> : null}
+        {np?.current ? (
+          <button
+            type="button"
+            className="btn btn--primary"
+            style={{ width: '100%', marginTop: 16 }}
+            onClick={() => saveSettings({ skipAt: Date.now() }, 'Suivant demandé : le DJ enchaîne sur la prochaine mesure.')}
+          >
+            Suivant
+          </button>
+        ) : null}
       </Section>
 
       <Section title="Votes" aside={<span className="mono muted">demi-vie 20 min</span>}>

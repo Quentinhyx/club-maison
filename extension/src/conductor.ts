@@ -26,6 +26,8 @@ import type {
   TrackRef,
   TransitionPlan,
   AutomationLane,
+  TrackStructure,
+  TrackWaveform,
   GroovePlan,
   GrooveStyle,
 } from '../../shared/contracts';
@@ -47,6 +49,13 @@ export interface MixerLike {
   updateGroove?(bpm: number, anchorCtx: number): void;
   stopGroove?(atCtx: number, fadeBeats: number): AutomationLane[];
   getGrooveState?(): { running: boolean; style?: GrooveStyle; bpm?: number; beat?: number };
+  // échantillonneur de boucles (optionnel selon la version de la table)
+  holdLoop?(deck: DeckId, o: { atCtx: number; beats: number; bpm: number }): unknown;
+  setLoopLength?(deck: DeckId, beats: number, atCtx?: number): unknown;
+  releaseLoop?(deck: DeckId, atCtx: number): unknown;
+  isLooping?(deck: DeckId): boolean;
+  /** Boucle le sortant tant que isReady() est faux ; renvoie (ou promet) l'instant ctx de relâche. */
+  holdUntil?(deck: DeckId, atCtx: number, bpm: number, isReady: () => boolean, maxBeats: number): number | Promise<number> | unknown;
 }
 
 export type RateRampFn = (from: number, to: number, startCtx: number, overBeats: number, bpm: number, steps?: number) => Array<{ t: number; rate: number }>;
@@ -75,6 +84,24 @@ export type PhaseNudgeFn = (a: {
   currentRate: number;
 }) => { rate: number; errorBeats: number };
 
+/** Scanner d'un morceau complet (shared/analysis TrackScanner). */
+export interface ScannerLike {
+  push(frame: Float32Array, trackPosStart: number, trackPosEnd: number): void;
+  getWaveform(trackId: number): TrackWaveform;
+  getStructure(bpmHint?: number): TrackStructure | undefined;
+  coverage(): number;
+}
+
+/** Pré-écoute accélérée sur la platine libre (Deezer) : fourni par le moteur, absent en démo. */
+export interface ScanSupport {
+  /** Vrai si cette platine peut être pré-écoutée (lecteur Deezer). */
+  supported(deck: DeckId): boolean;
+  sampleRate: number;
+  create(opts: { sampleRate: number; duration: number; bpmHint?: number }): ScannerLike;
+  /** Branche une capture PCM sur la sortie (avant fader) de la platine ; renvoie la fonction d'arrêt. */
+  capture(deck: DeckId, onFrame: (frame: Float32Array, endCtx: number) => void): () => void;
+}
+
 export interface ConductorDeps {
   /** Temps du contexte audio (s). */
   nowCtx(): number;
@@ -97,6 +124,11 @@ export interface ConductorDeps {
   startLatency?(deck: DeckId): number;
   /** Retard du son capté par rapport à la position rapportée par la platine (s). */
   outputLatency?(deck: DeckId): number;
+  /** Latence de démarrage réellement mesurée (s) : la platine peut affiner son estimation. */
+  reportLatency?(deck: DeckId, seconds: number): void;
+  /** Morceaux similaires au morceau qui commence (radio de l'artiste, artistes proches, ou démo). */
+  similar?(track: TrackRef): Promise<TrackRef[]>;
+  scan?: ScanSupport;
   timers?: { setTimeout(fn: () => void, ms: number): unknown; clearTimeout(h: unknown): void };
   tickMs?: number;
   guestPollMs?: number;
@@ -136,6 +168,9 @@ export interface ConductorSnapshot {
   currentGenre?: Genre;
   groove?: GrooveView;
   baseRate: Record<DeckId, number>;
+  /** Pré-écoute en cours : platine, morceau, couverture 0..1. */
+  scans: Partial<Record<DeckId, { trackId: number; coverage: number }>>;
+  skipRequestedAt?: number;
 }
 
 export function defaultCrowd(): CrowdState {
@@ -147,6 +182,20 @@ export function defaultCrowd(): CrowdState {
     updatedAt: 0,
   };
 }
+
+interface ScanJob {
+  trackId: number;
+  scanner: ScannerLike;
+  rate: number;
+  startAt: number;
+  stop: () => void;
+  lastStructAt: number;
+  startedCtx: number;
+  verified: boolean;
+}
+
+/** Vitesses essayées pour la pré-écoute (Chrome coupe le son au-delà de ×4). */
+const SCAN_RATES = [4, 2];
 
 interface RunningTransition {
   plan: TransitionPlan;
@@ -160,9 +209,25 @@ interface RunningTransition {
   relaxEndCtx: number;
   outgoingStopped: boolean;
   playTimer?: unknown;
+  /** Instant où l'entrant doit devenir audible (son « 1 »). */
+  audibleAt: number;
+  /** Position de l'entrant au moment du play (pour savoir s'il avance vraiment). */
+  playPos?: number;
+  playIssuedAt?: number;
+  latencyMeasured?: boolean;
+  readyWarned?: boolean;
+  waitingReady?: boolean;
+  hold: 'none' | 'holding' | 'released';
+  holdStartedAt?: number;
+  ownLoop?: boolean;
+  holdToken?: number;
 }
 
+export interface LoopView { deck: DeckId; atCtx: number; beats: number; bpm: number; kind: 'loop' | 'loop-roll' | 'hold' }
+
 const PREROLL_BEATS = 8;
+/** Au-delà, on abandonne l'entrant qui ne démarre pas (en temps du sortant). */
+const MAX_HOLD_BEATS = 64;
 const TAIL_SECONDS = 4;
 const SILENCE_LIMIT = 3;
 
@@ -174,7 +239,15 @@ export class Conductor {
   private loop?: ReturnType<typeof setInterval>;
   private queue: QueueItem[] = [];
   private guestNames: Record<string, string> = {};
-  private candidates = new Map<number, { track: TrackRef; analysis?: TrackAnalysis; genre: Genre }>();
+  private candidates = new Map<number, { track: TrackRef; analysis?: TrackAnalysis; genre: Genre; source?: 'catalog' | 'similar' }>();
+  private skipRequestedAt?: number;
+  private lastHostSkip = 0;
+  private similarDone = new Set<number>();
+  private scans: Partial<Record<DeckId, ScanJob>> = {};
+  private waveforms = new Map<number, TrackWaveform>();
+  private structures = new Map<number, TrackStructure>();
+  private noScan = new Set<number>();
+  private loadStartAt: Partial<Record<DeckId, number>> = {};
   private analyses = new Map<number, TrackAnalysis>();
   private analysisFailed = new Set<number>();
   private analysisQueue: TrackRef[] = [];
@@ -192,6 +265,7 @@ export class Conductor {
   private lastGuestPoll = -Infinity;
   private guestStatus: ConductorSnapshot['guest'];
   private seenRequests = new Set<string>();
+  private failedTracks = new Set<number>();
   private playedRequests = new Set<string>();
   private emergencyAt = -Infinity;
   private currentGenre?: Genre;
@@ -227,6 +301,7 @@ export class Conductor {
 
   stop(): void {
     this.running = false;
+    for (const id of DECK_IDS) this.stopScan(id, 'arrêt');
     if (this.loop) clearInterval(this.loop);
     this.loop = undefined;
     for (const id of DECK_IDS) void this.d.decks[id].pause().catch(() => {});
@@ -311,6 +386,7 @@ export class Conductor {
   }
 
   async manualPlay(deck: DeckId): Promise<void> {
+    this.stopScan(deck, 'lecture à la main');
     await this.d.decks[deck].play().catch((e) => this.log('error', `Lecture ${deck} : ${errMsg(e)}`));
     this.markStarted(deck);
   }
@@ -323,13 +399,45 @@ export class Conductor {
   // ------------------------------------------------------------------------------- lecture d'état
 
   getAnalysis(id: number): TrackAnalysis | undefined {
-    return this.analyses.get(id) ?? this.d.cachedAnalysis?.(id);
+    const a = this.analyses.get(id) ?? this.d.cachedAnalysis?.(id);
+    const st = this.structures.get(id);
+    return a && st && !a.structure ? { ...a, structure: st } : a;
+  }
+
+  /** Forme d'onde complète issue de la pré-écoute (Deezer), si elle existe. */
+  getWaveform(id: number): TrackWaveform | undefined {
+    return this.waveforms.get(id);
+  }
+
+  /** Position de départ choisie par le cerveau pour le morceau chargé sur cette platine. */
+  getLoadStartAt(id: DeckId): number | undefined {
+    return this.loadStartAt[id];
+  }
+
+  /** « Suivant » : le cerveau sort du morceau en cours au plus vite (bouton, clavier, téléphone). */
+  requestSkip(from = 'console'): void {
+    this.skipRequestedAt = this.d.nowMs();
+    this.log('info', `Suivant demandé (${from}).`);
+    this.emit();
+  }
+
+  /** Couverture de la pré-écoute en cours sur cette platine (0..1), ou undefined. */
+  getScan(id: DeckId): { trackId: number; coverage: number } | undefined {
+    const j = this.scans[id];
+    return j ? { trackId: j.trackId, coverage: j.scanner.coverage() } : undefined;
+  }
+
+  getSkipRequestedAt(): number | undefined {
+    return this.skipRequestedAt;
   }
 
   deckStates(): Record<DeckId, DeckState> {
     const out = {} as Record<DeckId, DeckState>;
     for (const id of DECK_IDS) {
-      const s = this.d.decks[id].getState();
+      let s = this.d.decks[id].getState();
+      const job = this.scans[id];
+      // pendant la pré-écoute, la platine reste « prête » au point de départ pour le reste du monde
+      if (job) s = { ...s, status: 'ready', position: job.startAt, rate: 1, live: undefined };
       const analysis = s.analysis ?? (s.track ? this.getAnalysis(s.track.id) : undefined);
       const live = s.status === 'playing' ? this.d.analyzers[id].getState() : undefined;
       out[id] = { ...s, analysis, live: live ?? s.live };
@@ -342,7 +450,7 @@ export class Conductor {
     let best: DeckId | null = null;
     let bestGain = 0.05;
     for (const id of DECK_IDS) {
-      if (states[id].status !== 'playing') continue;
+      if (states[id].status !== 'playing' && !this.d.mixer.isLooping?.(id)) continue;
       const g = safeParam(this.d.mixer, `${id}.gain` as ParamTarget, 1);
       if (g > bestGain) {
         bestGain = g;
@@ -359,6 +467,30 @@ export class Conductor {
 
   getActiveFx(): ActiveFx[] {
     return this.activeFx;
+  }
+
+  /** Boucles en cours, par platine (effets 'loop' / 'loop-roll' et maintien du sortant). */
+  getLoops(): Partial<Record<DeckId, LoopView>> {
+    const now = this.d.nowCtx();
+    const out: Partial<Record<DeckId, LoopView>> = {};
+    for (const f of this.activeFx) {
+      const c = f.cue;
+      if ((c.kind !== 'loop' && c.kind !== 'loop-roll') || c.target === 'master' || now < c.atCtx) continue;
+      let beats = c.loopBeats ?? 1;
+      if (c.kind === 'loop-roll') {
+        const k = Math.min(3, Math.floor(((now - c.atCtx) / Math.max(0.01, f.endCtx - c.atCtx)) * 4));
+        beats = beats / Math.pow(2, k);
+      }
+      out[c.target] = { deck: c.target, atCtx: c.atCtx, beats, bpm: c.bpm, kind: c.kind };
+    }
+    const tr = this.tr;
+    if (tr && tr.hold === 'holding' && tr.plan.holdWithLoop !== false && !out[tr.plan.from]) {
+      out[tr.plan.from] = { deck: tr.plan.from, atCtx: tr.holdStartedAt ?? now, beats: 4, bpm: tr.plan.bpm, kind: 'hold' };
+    }
+    for (const id of DECK_IDS) {
+      if (!out[id] && this.d.mixer.isLooping?.(id)) out[id] = { deck: id, atCtx: now, beats: 4, bpm: tr?.plan.bpm ?? 120, kind: 'hold' };
+    }
+    return out;
   }
 
   getGroove(): GrooveView | undefined {
@@ -393,6 +525,10 @@ export class Conductor {
       currentGenre: this.currentGenre,
       groove: this.groove,
       baseRate: { ...this.baseRate },
+      scans: Object.fromEntries(
+        DECK_IDS.filter((d) => this.scans[d]).map((d) => [d, { trackId: this.scans[d]!.trackId, coverage: this.scans[d]!.scanner.coverage() }]),
+      ) as ConductorSnapshot['scans'],
+      skipRequestedAt: this.skipRequestedAt,
     };
   }
 
@@ -413,6 +549,7 @@ export class Conductor {
       if (this.running) {
         this.driveTransition(now, states);
         this.driveFx(now, states);
+        this.driveScans(now, states);
         this.applyRamps(now, states);
         this.keepTempo(nowMs, states);
         if (this.autopilot) {
@@ -439,11 +576,12 @@ export class Conductor {
       queue: this.queue,
       candidates: [...this.candidates.values()]
         .filter((c) => !this.isUsed(c.track.id))
-        .map((c) => ({ ...c, analysis: c.analysis ?? this.getAnalysis(c.track.id) })),
+        .map((c) => ({ ...c, analysis: this.getAnalysis(c.track.id) ?? c.analysis })),
       crowd: this.crowd,
       settings: this.settings,
       history: this.history,
       activeTransition: this.tr?.plan,
+      skipRequestedAt: this.skipRequestedAt,
     };
     // toutes les analyses connues (file, candidats, platines) : le cerveau juge ainsi les re-edits avant chargement
     const analyses: Record<number, TrackAnalysis> = {};
@@ -466,6 +604,7 @@ export class Conductor {
   }
 
   private isUsed(id: number): boolean {
+    if (this.failedTracks.has(id)) return true;
     if (this.history.some((h) => h.track.id === id)) return true;
     if (this.queue.some((q) => q.track.id === id)) return true;
     for (const d of DECK_IDS) if (this.d.decks[d].getState().track?.id === id) return true;
@@ -594,6 +733,147 @@ export class Conductor {
     if (this.groove?.endCtx !== undefined && now > this.groove.endCtx) this.groove = undefined;
   }
 
+  // ----------------------------------------------------------------------------- pré-écoute accélérée
+
+  /** Lance / suit / arrête la pré-écoute ×4 du morceau chargé sur la platine libre. */
+  private driveScans(now: number, _states: Record<DeckId, DeckState>): void {
+    const sc = this.d.scan;
+    if (!sc) return;
+    for (const id of DECK_IDS) {
+      const job = this.scans[id];
+      const raw = this.d.decks[id].getState();
+      if (job) {
+        // vérification que la vitesse ×N a été acceptée
+        if (!job.verified && now - job.startedCtx > 1.5) {
+          job.verified = true;
+          if (raw.status !== 'playing' || Math.abs(raw.rate - job.rate) > 0.05) {
+            const next = SCAN_RATES[SCAN_RATES.indexOf(job.rate) + 1];
+            this.stopScan(id, `vitesse ×${job.rate} refusée`);
+            if (next) this.startScan(id, next, now);
+            else this.noScan.add(job.trackId);
+            continue;
+          }
+        }
+        if (now - job.lastStructAt > 3) {
+          job.lastStructAt = now;
+          this.publishScan(job);
+        }
+        const nearEnd = raw.duration > 0 && raw.position >= raw.duration - 0.6;
+        if (raw.status === 'ended' || nearEnd || job.scanner.coverage() >= 0.995) this.stopScan(id, 'fin du morceau');
+        continue;
+      }
+      if (!this.canScanNow(id, raw)) continue;
+      this.startScan(id, SCAN_RATES[0], now);
+    }
+  }
+
+  private canScanNow(id: DeckId, st: DeckState): boolean {
+    const sc = this.d.scan;
+    if (!sc || !sc.supported(id) || !st.track) return false;
+    if (st.status !== 'ready' && st.status !== 'paused') return false;
+    if (this.loading[id] !== undefined || !st.caps.canSetRate) return false;
+    if (this.noScan.has(st.track.id)) return false;
+    const w = this.waveforms.get(st.track.id);
+    if (w && w.coverage >= 0.98) return false;
+    if (this.tr && (this.tr.plan.to === id || this.tr.plan.from === id)) return false; // jamais pendant pré-lancement / transition
+    if (this.isAudible(id)) return false;
+    // il faut un morceau à l'antenne qui dure encore un peu, sinon on garde la platine prête
+    const other = DECK_IDS.find((d) => d !== id)!;
+    const o = this.d.decks[other].getState();
+    if (o.status !== 'playing' || (o.duration || 0) - o.position < 25) return false;
+    return true;
+  }
+
+  private startScan(id: DeckId, rate: number, now: number): void {
+    const sc = this.d.scan!;
+    const deck = this.d.decks[id];
+    const st = deck.getState();
+    const track = st.track!;
+    const scanner = sc.create({ sampleRate: sc.sampleRate, duration: st.duration || track.duration, bpmHint: this.getAnalysis(track.id)?.bpm ?? track.bpm });
+    const outLat = this.d.outputLatency?.(id) ?? 0;
+    const job: ScanJob = {
+      trackId: track.id,
+      scanner,
+      rate,
+      startAt: this.loadStartAt[id] ?? st.position,
+      stop: () => {},
+      lastStructAt: now,
+      startedCtx: now,
+      verified: false,
+    };
+    safeSet(this.d.mixer, `${id}.gain` as ParamTarget, 0);
+    job.stop = sc.capture(id, (frame, endCtx) => {
+      const s = deck.getState();
+      if (s.status !== 'playing') return;
+      const r = s.rate || rate;
+      const posEnd = s.position - (this.d.nowCtx() - endCtx) * r - outLat * r;
+      const posStart = posEnd - (frame.length / sc.sampleRate) * r;
+      if (posStart >= 0) scanner.push(frame, posStart, posEnd);
+    });
+    this.scans[id] = job;
+    void deck.seek(0).catch(() => {});
+    void deck.setRate(rate).catch(() => {});
+    void deck.play().catch(() => {});
+    this.log('info', `Pré-écoute ×${rate} de « ${track.title} » sur ${id} (forme d'onde et structure du morceau complet).`);
+  }
+
+  /** Arrête la pré-écoute : pause, vitesse de base, retour au point de départ choisi par le cerveau. */
+  private stopScan(id: DeckId, why: string): void {
+    const job = this.scans[id];
+    if (!job) return;
+    delete this.scans[id];
+    try {
+      job.stop();
+    } catch {
+      /* rien */
+    }
+    this.publishScan(job);
+    const deck = this.d.decks[id];
+    void deck.pause().catch(() => {});
+    void deck.setRate(this.baseRate[id] || 1).catch(() => {});
+    void deck.seek(job.startAt).catch(() => {});
+    this.lastRateSent[id] = undefined;
+    this.d.analyzers[id].reset(this.getAnalysis(job.trackId)?.bpm);
+    const cov = Math.round(job.scanner.coverage() * 100);
+    this.log('info', `Pré-écoute arrêtée sur ${id} (${why}) : ${cov} % du morceau analysé.`);
+  }
+
+  /** Publie la forme d'onde et la structure (donc BrainInput.analyses) au fil du scan. */
+  private publishScan(job: ScanJob): void {
+    try {
+      const w = job.scanner.getWaveform(job.trackId);
+      this.waveforms.set(job.trackId, w);
+      const st = job.scanner.getStructure(this.getAnalysis(job.trackId)?.bpm);
+      if (st) {
+        this.structures.set(job.trackId, st);
+        const a = this.analyses.get(job.trackId);
+        if (a) this.analyses.set(job.trackId, { ...a, structure: st });
+      }
+    } catch {
+      /* scan trop court pour conclure */
+    }
+  }
+
+  /** Similaires du morceau qui commence : candidats « similar » (même genre que le morceau en cours). */
+  private fetchSimilar(deck: DeckId, t: TrackRef): void {
+    if (!this.d.similar || this.similarDone.has(t.id)) return;
+    this.similarDone.add(t.id);
+    const genre = this.deckGenre[deck] ?? t.genres?.[0] ?? this.currentGenre ?? this.settings.baseGenre;
+    this.d
+      .similar(t)
+      .then((list) => {
+        let added = 0;
+        for (const s2 of list) {
+          if (this.isUsed(s2.id) || this.crowd.host.blockedTrackIds.includes(s2.id) || this.candidates.has(s2.id)) continue;
+          this.candidates.set(s2.id, { track: s2, genre, source: 'similar', analysis: this.getAnalysis(s2.id) });
+          added++;
+        }
+        list.slice(0, 10).forEach((x) => this.enqueueAnalysis(x));
+        if (added) this.log('info', `${added} morceaux proches de « ${t.title} » ajoutés aux candidats.`);
+      })
+      .catch((e) => this.log('warn', `Similaires de « ${t.title} » indisponibles : ${errMsg(e)}`));
+  }
+
   private wantGenre(genre: Genre, bpmMin: number, bpmMax: number, reason: string): void {
     const key = `${genre}:${Math.round(bpmMin)}-${Math.round(bpmMax)}`;
     const nowMs = this.d.nowMs();
@@ -609,7 +889,7 @@ export class Conductor {
         for (const t of tracks) {
           if (this.isUsed(t.id) || this.crowd.host.blockedTrackIds.includes(t.id)) continue;
           if (!this.candidates.has(t.id)) {
-            this.candidates.set(t.id, { track: t, genre, analysis: this.getAnalysis(t.id) });
+            this.candidates.set(t.id, { track: t, genre, source: 'catalog', analysis: this.getAnalysis(t.id) });
             added++;
           }
         }
@@ -662,8 +942,10 @@ export class Conductor {
 
   async loadDeck(deck: DeckId, track: TrackRef, startAt: number, _reason: string): Promise<void> {
     if (this.loading[deck] === track.id) return;
+    this.stopScan(deck, 'nouveau morceau');
     this.loading[deck] = track.id;
     this.readySince[deck] = undefined;
+    this.loadStartAt[deck] = startAt;
     const c = this.candidates.get(track.id);
     this.deckGenre[deck] = c?.genre ?? track.genres?.[0] ?? this.currentGenre;
     this.candidates.delete(track.id);
@@ -695,69 +977,215 @@ export class Conductor {
     }
     const deck = this.d.decks[plan.to];
     const st = deck.getState();
-    if (!st.track || (st.status !== 'ready' && st.status !== 'paused' && st.status !== 'playing')) {
-      this.log('warn', `Transition vers ${plan.to} impossible : platine pas prête (${st.status}).`);
+    const stillLoading = st.status === 'loading' || this.loading[plan.to] !== undefined;
+    if (!st.track && !stillLoading) {
+      this.log('warn', `Transition vers ${plan.to} impossible : platine vide.`);
       return;
     }
+    if (!stillLoading && st.status !== 'ready' && st.status !== 'paused' && st.status !== 'playing') {
+      this.log('warn', `Transition vers ${plan.to} impossible : platine ${st.status}.`);
+      return;
+    }
+    if (stillLoading) this.log('warn', `Platine ${plan.to} encore en chargement : la boucle tiendra le sortant si besoin.`);
+    this.stopScan(plan.to, 'transition');
     const spb = 60 / plan.bpm;
     const lat = Math.max(0, this.d.startLatency?.(plan.to) ?? 0);
     const rate = st.caps.canSetRate ? plan.incomingRate : 1;
-    // pré-lancement fader fermé : quelques mesures avant le premier temps, si on peut reculer
+    const outgoingAudible = this.isAudible(plan.from);
+    // pré-lancement fader fermé, pour TOUTES les techniques : l'entrant tourne déjà quand il doit sonner
     let preroll = 0;
-    if (st.caps.canSeek && st.status !== 'playing') {
-      preroll = Math.min(PREROLL_BEATS * spb, Math.max(0, plan.incomingStartPos) / Math.max(0.5, rate));
+    let seekTo: number | undefined = plan.incomingStartPos;
+    if (st.status !== 'playing' && outgoingAudible) {
+      const want = Math.max(0, plan.preRollBeats ?? PREROLL_BEATS) * spb;
+      if (st.caps.canSeek || stillLoading) {
+        preroll = Math.min(want, Math.max(0, plan.incomingStartPos) / Math.max(0.5, rate));
+        seekTo = Math.max(0, plan.incomingStartPos - preroll * rate);
+      } else {
+        seekTo = undefined; // pas de seek : on part d'où la platine est
+        preroll = Math.max(0, (plan.incomingStartPos - st.position) / Math.max(0.5, rate));
+      }
     }
-    const outgoingAudible =
-      this.d.decks[plan.from].getState().status === 'playing' && safeParam(this.d.mixer, `${plan.from}.gain` as ParamTarget, 0) > 0.05;
-    if (!outgoingAudible) preroll = 0; // ouverture ou reprise après un silence : pas de calage à faire
     let p = { ...plan };
     let playAt = p.incomingStartCtx - preroll - lat;
     if (st.status !== 'playing' && playAt < now + 0.05 && !outgoingAudible) {
-      // rien à caler : on décale juste ce qu'il faut pour absorber la latence de la platine
-      const shift = now + 0.05 - playAt;
-      p = { ...p, startCtx: p.startCtx + shift, incomingStartCtx: p.incomingStartCtx + shift };
-      playAt += shift;
+      // ouverture : rien à caler, on décale juste ce qu'il faut pour absorber la latence
+      p = shiftPlan(p, now + 0.05 - playAt);
+      playAt = now + 0.05;
     } else if (st.status !== 'playing' && playAt < now + 0.05) {
       // trop tard : on décale toute la transition d'un nombre entier de mesures (la grille reste juste)
       const bar = 4 * spb;
       const shift = Math.ceil((now + 0.05 - playAt) / bar) * bar;
-      p = { ...p, startCtx: p.startCtx + shift, incomingStartCtx: p.incomingStartCtx + shift };
+      p = shiftPlan(p, shift);
       playAt += shift;
       this.log('warn', `Transition décalée de ${Math.round(shift / spb)} temps (platine ${plan.to} trop lente à démarrer).`);
     }
     let lanes: AutomationLane[] = [];
     this.d.mixer.setTempo?.(p.bpm);
     if (st.status !== 'playing') safeSet(this.d.mixer, `${p.to}.gain` as ParamTarget, 0);
+    if (this.d.mixer.isLooping?.(p.from)) this.d.mixer.releaseLoop?.(p.from, Math.max(now, p.startCtx));
     try {
       lanes = this.d.mixer.runTransition(p);
     } catch (e) {
       this.log('error', `La table n'a pas pu programmer la transition : ${errMsg(e)}`);
       return;
     }
-    for (const cue of p.accents ?? []) {
-      this.activeFx.push({ cue, endCtx: cue.atCtx + (cue.beats * 60) / cue.bpm });
-    }
+    for (const cue of p.accents ?? []) this.activeFx.push({ cue, endCtx: cue.atCtx + (cue.beats * 60) / cue.bpm });
     const endCtx = p.startCtx + p.beats * spb;
-    const tr: RunningTransition = {
+    this.tr = {
       plan: p,
       lanes,
       phase: 'scheduled',
       playAtCtx: playAt,
+      seekTo,
       playIssued: st.status === 'playing',
+      playPos: st.status === 'playing' ? st.position : undefined,
       startedHistory: false,
       endCtx,
       relaxEndCtx: endCtx + (p.rateRelaxBeats ?? 0) * spb,
       outgoingStopped: false,
+      audibleAt: p.incomingStartCtx,
+      hold: 'none',
     };
-    if (preroll > 0) tr.seekTo = Math.max(0, p.incomingStartPos - preroll * rate);
-    else tr.seekTo = p.incomingStartPos;
-    this.tr = tr;
     this.baseRate[p.to] = rate;
     this.ramps = this.ramps.filter((r) => r.deck !== p.to);
+    if (!stillLoading) this.prepareIncoming(this.tr, st, rate);
+  }
+
+  /** Vitesse et seek de l'entrant avant son pré-lancement. */
+  private prepareIncoming(tr: RunningTransition, st: DeckState, rate: number): void {
+    const deck = this.d.decks[tr.plan.to];
     if (st.caps.canSetRate && Math.abs(st.rate - rate) > 0.0005) void deck.setRate(rate).catch(() => {});
     if (st.status !== 'playing' && st.caps.canSeek && tr.seekTo !== undefined && Math.abs(st.position - tr.seekTo) > 0.05) {
       void deck.seek(tr.seekTo).catch(() => {});
     }
+  }
+
+  /** La platine est-elle entendue (en lecture ou tenue par une boucle, fader ouvert) ? */
+  private isAudible(id: DeckId): boolean {
+    const st = this.d.decks[id].getState();
+    const looping = !!this.d.mixer.isLooping?.(id);
+    return (st.status === 'playing' || looping) && safeParam(this.d.mixer, `${id}.gain` as ParamTarget, 0) > 0.05;
+  }
+
+  /** L'entrant joue-t-il réellement (position qui avance, ou son capté) ? */
+  private incomingRunning(tr: RunningTransition): boolean {
+    const st = this.d.decks[tr.plan.to].getState();
+    if (st.status !== 'playing') return false;
+    const advanced = tr.playPos !== undefined ? st.position > tr.playPos + 0.03 : true;
+    let level = 0;
+    try {
+      level = (this.d.mixer.getLevels() as Record<string, number>)[tr.plan.to] ?? 0;
+    } catch {
+      /* rien */
+    }
+    return advanced || level > 0.003;
+  }
+
+  /** L'entrant n'a pas démarré à temps : on tient le sortant en boucle et on décale la transition. */
+  private startHold(tr: RunningTransition, now: number): void {
+    const p = tr.plan;
+    const spb = 60 / p.bpm;
+    tr.hold = 'holding';
+    tr.holdStartedAt = now;
+    tr.holdToken = (tr.holdToken ?? 0) + 1;
+    const token = tr.holdToken;
+    try {
+      this.d.mixer.cancelFrom(now);
+    } catch {
+      /* rien */
+    }
+    safeSet(this.d.mixer, `${p.to}.gain` as ParamTarget, 0);
+    safeSet(this.d.mixer, `${p.from}.gain` as ParamTarget, 1);
+    this.activeFx = this.activeFx.filter((f) => f.cue.atCtx < now);
+    const useLoop = p.holdWithLoop !== false;
+    this.log('warn', `La platine ${p.to} n'a pas encore démarré : ${useLoop ? 'boucle sur' : 'on prolonge'} la platine ${p.from} en attendant.`);
+    if (!useLoop) return;
+    const m = this.d.mixer;
+    if (m.holdUntil) {
+      try {
+        const r = m.holdUntil(p.from, now, p.bpm, () => this.incomingRunning(tr), MAX_HOLD_BEATS);
+        const onR = (R: unknown) => {
+          if (this.tr !== tr || tr.holdToken !== token || typeof R !== 'number' || !Number.isFinite(R)) return;
+          if (this.incomingRunning(tr)) this.releaseHold(tr, R);
+          else this.failIncoming(tr, 'la platine ne démarre pas');
+        };
+        if (r && typeof (r as Promise<number>).then === 'function') void (r as Promise<number>).then(onR, () => {});
+        else onR(r);
+      } catch (e) {
+        this.log('warn', `Boucle impossible : ${errMsg(e)}`);
+      }
+    } else if (m.holdLoop) {
+      try {
+        m.holdLoop(p.from, { atCtx: now + 0.02, beats: 4, bpm: p.bpm });
+        tr.ownLoop = true;
+      } catch (e) {
+        this.log('warn', `Boucle impossible : ${errMsg(e)}`);
+      }
+    }
+    void spb;
+  }
+
+  /** L'entrant tourne enfin : on cale la nouvelle entrée sur la grille et on replanifie la transition. */
+  private releaseHold(tr: RunningTransition, releaseCtx: number): void {
+    const now = this.d.nowCtx();
+    const p = tr.plan;
+    const spb = 60 / p.bpm;
+    const st = this.d.decks[p.to].getState();
+    const rate = st.rate || 1;
+    const outLat = this.d.outputLatency?.(p.to) ?? 0;
+    // instant où l'entrant arrivera à son point d'entrée, ramené sur la grille du sortant
+    const tStar = now + (p.incomingStartPos - st.position) / rate + outLat;
+    const old = p.incomingStartCtx;
+    let newStart = old + Math.round((tStar - old) / spb) * spb;
+    let posShift = 0;
+    const earliest = Math.max(releaseCtx, now + 0.1);
+    if (newStart < earliest) {
+      const n = Math.ceil((earliest - newStart) / (4 * spb));
+      newStart += n * 4 * spb;
+      posShift = n * 4 * spb * rate; // on entre quelques mesures plus loin dans l'entrant
+    }
+    const shift = newStart - old;
+    const np = shiftPlan({ ...p, incomingStartPos: p.incomingStartPos + posShift }, shift);
+    if (tr.ownLoop) this.d.mixer.releaseLoop?.(p.from, Math.max(now, Math.min(releaseCtx, np.startCtx)));
+    try {
+      this.d.mixer.cancelFrom(now);
+      tr.lanes = this.d.mixer.runTransition(np);
+    } catch (e) {
+      this.log('error', `Replanification impossible : ${errMsg(e)}`);
+    }
+    for (const cue of np.accents ?? []) this.activeFx.push({ cue, endCtx: cue.atCtx + (cue.beats * 60) / cue.bpm });
+    tr.plan = np;
+    tr.audibleAt = np.incomingStartCtx;
+    tr.endCtx = np.startCtx + np.beats * spb;
+    tr.relaxEndCtx = tr.endCtx + (np.rateRelaxBeats ?? 0) * spb;
+    tr.phase = now < np.startCtx ? 'scheduled' : 'running';
+    tr.hold = 'released';
+    this.log('warn', `Transition décalée de ${shift.toFixed(1)} s : la platine ${p.to} a démarré en retard.`);
+  }
+
+  /** L'entrant ne démarre jamais : abandon, le sortant continue (ou reste en boucle), morceau de secours. */
+  private failIncoming(tr: RunningTransition, why: string): void {
+    const now = this.d.nowCtx();
+    const p = tr.plan;
+    this.log('error', `Platine ${p.to} : ${why}. Transition abandonnée, morceau de secours.`);
+    try {
+      this.d.mixer.cancelFrom(now);
+    } catch {
+      /* rien */
+    }
+    safeSet(this.d.mixer, `${p.to}.gain` as ParamTarget, 0);
+    safeSet(this.d.mixer, `${p.from}.gain` as ParamTarget, 1);
+    const from = this.d.decks[p.from].getState();
+    const left = (from.duration || 0) - from.position;
+    if (tr.ownLoop && from.status === 'playing' && left > 8) this.d.mixer.releaseLoop?.(p.from, now);
+    void this.d.decks[p.to].pause().catch(() => {});
+    const failed = this.d.decks[p.to].getState().track;
+    if (failed) this.failedTracks.add(failed.id);
+    this.activeFx = [];
+    this.tr = undefined;
+    void this.pickFallback().then((t) => {
+      if (t) void this.loadDeck(p.to, t, 0, 'secours');
+    });
   }
 
   private cancelTransition(why: string): void {
@@ -792,14 +1220,53 @@ export class Conductor {
     const st = states[p.to];
     const tickS = (this.d.tickMs ?? 100) / 1000;
 
+    const isReady = st.status === 'ready' || st.status === 'paused' || st.status === 'playing';
+    if (!isReady && !tr.readyWarned && now >= tr.playAtCtx - 3) {
+      tr.readyWarned = true;
+      this.log('warn', `Platine ${p.to} pas prête ${Math.max(0, tr.playAtCtx - now).toFixed(1)} s avant son pré-lancement.`);
+    }
+    if (tr.waitingReady && isReady) {
+      tr.waitingReady = false;
+      this.prepareIncoming(tr, st, this.baseRate[p.to]);
+    }
     if (!tr.playIssued && now >= tr.playAtCtx - tickS * 1.5) {
-      tr.playIssued = true;
-      const delayMs = Math.max(0, (tr.playAtCtx - now) * 1000);
-      const go = () => {
-        void deck.play().catch((e) => this.log('error', `Lecture ${p.to} impossible : ${errMsg(e)}`));
-      };
-      if (delayMs > 5 && this.d.timers) tr.playTimer = this.d.timers.setTimeout(go, delayMs);
-      else go();
+      if (!isReady) {
+        tr.waitingReady = true; // la boucle tiendra le sortant si besoin
+      } else {
+        tr.playIssued = true;
+        const delayMs = Math.max(0, (tr.playAtCtx - now) * 1000);
+        const go = () => {
+          tr.playIssuedAt = this.d.nowCtx();
+          tr.playPos = this.d.decks[p.to].getState().position;
+          void deck.play().catch((e) => this.log('error', `Lecture ${p.to} impossible : ${errMsg(e)}`));
+        };
+        if (delayMs > 5 && this.d.timers) tr.playTimer = this.d.timers.setTimeout(go, delayMs);
+        else go();
+      }
+    }
+    // latence réelle de démarrage : du play() au moment où la position avance / le son arrive
+    if (tr.playIssuedAt !== undefined && !tr.latencyMeasured && this.incomingRunning(tr)) {
+      tr.latencyMeasured = true;
+      const measured = now - tr.playIssuedAt;
+      if (measured >= 0 && measured < 10) this.d.reportLatency?.(p.to, measured);
+    }
+    // plus jamais de blanc : l'entrant doit tourner quand il devient audible, sinon on tient le sortant
+    if (tr.hold === 'none' && now >= tr.audibleAt - 0.15 && !this.incomingRunning(tr) && this.isAudible(p.from)) {
+      this.startHold(tr, now);
+    }
+    if (tr.hold === 'holding') {
+      const spb = 60 / p.bpm;
+      if (!this.d.mixer.holdUntil && this.incomingRunning(tr)) {
+        // boucle maison (ou pas de boucle) : relâche sur la prochaine mesure
+        const t0 = tr.holdStartedAt ?? now;
+        const bar = 4 * spb;
+        const R = t0 + Math.ceil((now + 0.05 - t0) / bar) * bar;
+        this.releaseHold(tr, R);
+      } else if (now - (tr.holdStartedAt ?? now) > MAX_HOLD_BEATS * spb + 1) {
+        this.failIncoming(tr, 'elle ne démarre pas');
+        return;
+      }
+      if (this.tr !== tr || tr.hold === 'holding') return; // en attente : pas de calage ni de fin
     }
 
     if (now >= p.startCtx && tr.phase === 'scheduled') tr.phase = 'running';
@@ -809,7 +1276,7 @@ export class Conductor {
     }
 
     // calage de phase de l'entrant
-    if (st.caps.canSetRate && st.status === 'playing' && now >= tr.playAtCtx) {
+    if (st.caps.canSetRate && st.status === 'playing' && now >= tr.playAtCtx && this.incomingRunning(tr)) {
       // rate de base COURANT (rampes du cerveau comprises), jamais le rate déjà corrigé
       let base = this.baseRate[p.to];
       const relax = p.rateRelaxBeats !== undefined && p.rateRelaxBeats > 0 && !this.ramps.some((r) => r.deck === p.to);
@@ -852,8 +1319,9 @@ export class Conductor {
     if (!tr.outgoingStopped && now >= tr.endCtx + TAIL_SECONDS) {
       tr.outgoingStopped = true;
       const from = states[p.from];
-      if (from.status === 'playing' && safeParam(this.d.mixer, `${p.from}.gain` as ParamTarget, 0) < 0.08) {
-        void this.d.decks[p.from].pause().catch(() => {});
+      if (safeParam(this.d.mixer, `${p.from}.gain` as ParamTarget, 0) < 0.08) {
+        if (from.status === 'playing') void this.d.decks[p.from].pause().catch(() => {});
+        if (this.d.mixer.isLooping?.(p.from)) this.d.mixer.releaseLoop?.(p.from, now);
       }
       this.markEnded(p.from);
     }
@@ -922,7 +1390,10 @@ export class Conductor {
     }
     // platine à l'antenne tombée en erreur ou finie : réaction immédiate
     const crashed = DECK_IDS.some(
-      (id) => (states[id].status === 'error' || states[id].status === 'ended') && safeParam(this.d.mixer, `${id}.gain` as ParamTarget, 0) > 0.5,
+      (id) =>
+        (states[id].status === 'error' || states[id].status === 'ended') &&
+        !this.d.mixer.isLooping?.(id) &&
+        safeParam(this.d.mixer, `${id}.gain` as ParamTarget, 0) > 0.5,
     );
     this.silentSince ??= now;
     const silentFor = now - this.silentSince;
@@ -940,6 +1411,7 @@ export class Conductor {
     });
     if (ready.length) {
       const id = ready[0];
+      this.stopScan(id, 'relance d’urgence');
       this.cancelTransition('silence détecté');
       safeSet(this.d.mixer, `${other(id)}.gain` as ParamTarget, 0);
       safeSet(this.d.mixer, `${id}.gain` as ParamTarget, 1);
@@ -993,6 +1465,7 @@ export class Conductor {
     const last = this.history[this.history.length - 1];
     if (last && last.track.id === t.id && last.endedAt === undefined) return;
     this.history.push({ track: t, startedAt: this.d.nowMs(), genre: this.deckGenre[deck] });
+    this.fetchSimilar(deck, t);
     if (this.history.length > 300) this.history.shift();
     const qi = this.queue.find((q) => q.track.id === t.id);
     if (qi) {
@@ -1037,6 +1510,12 @@ export class Conductor {
       const st = await api.getState();
       this.crowd = st.crowd ?? this.crowd;
       for (const r of this.crowd.requests ?? []) if (r.status === 'accepted') this.acceptRequest(r);
+      const skipAt = this.crowd.host?.skipAt;
+      if (skipAt && skipAt > this.lastHostSkip) {
+        const first = this.lastHostSkip === 0 && this.history.length === 0;
+        this.lastHostSkip = skipAt;
+        if (!first && this.d.nowMs() - skipAt < 60_000) this.requestSkip('téléphone de l’hôte');
+      }
       this.guestStatus = { configured: true, ok: true, lastOkMs: this.d.nowMs() };
     } catch (e) {
       this.guestStatus = { ...this.guestStatus, configured: true, ok: false, lastError: errMsg(e) };
@@ -1066,6 +1545,17 @@ export class Conductor {
   private emit(): void {
     for (const l of this.listeners) l();
   }
+}
+
+/** Décale tout un plan de transition (et ses effets d'accompagnement) dans le temps. */
+export function shiftPlan(p: TransitionPlan, shift: number): TransitionPlan {
+  if (!shift) return p;
+  return {
+    ...p,
+    startCtx: p.startCtx + shift,
+    incomingStartCtx: p.incomingStartCtx + shift,
+    accents: (p.accents ?? []).map((c) => ({ ...c, atCtx: c.atCtx + shift })),
+  };
 }
 
 function clamp(v: number, a: number, b: number): number {

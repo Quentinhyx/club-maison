@@ -154,6 +154,8 @@ export function parseSettingsPatch(v: unknown): Result<Partial<HostSettings> & {
       p[k] = o[k] as boolean;
     }
   }
+  // « Suivant » depuis le téléphone : la valeur envoyée est ignorée, l'heure du serveur fait foi.
+  if ('skipAt' in o || o.skip === true) p.skipAt = Date.now();
   if ('maxRequestsPerGuest' in o) {
     const n = o.maxRequestsPerGuest;
     if (typeof n !== 'number' || !Number.isInteger(n) || n < 0 || n > 20) {

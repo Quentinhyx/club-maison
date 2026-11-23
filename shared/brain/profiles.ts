@@ -65,6 +65,14 @@ export interface StyleProfile {
   reEditCooldownTracks: number;
   /** Probabilité (× fxAmount × 2) de pousser le tempo de 1 % pendant un build. */
   buildPushChance: number;
+  /** Où entre le morceau suivant : 'intro' (début, mixable) ou 'hot' (premier drop / refrain estimé). */
+  incomingEntry: 'intro' | 'hot';
+  /** Probabilité de « drop swap » : sortir juste avant le drop du sortant, c'est l'entrant qui tombe. */
+  dropSwapChance: number;
+  /** Probabilité qu'un loop-roll devienne un « drop marrant » (boucle d'un temps -> 1/8, un temps de silence). */
+  funnyDropChance: number;
+  /** Le loop-roll est permis quand la grille n'est pas fiable (le roll masque l'imprécision). */
+  rollWithoutGrid: boolean;
 }
 
 function playMap(electro: [number, number], other: [number, number], over: Partial<Record<Genre, [number, number]>> = {}): Record<Genre, [number, number]> {
@@ -74,6 +82,49 @@ function playMap(electro: [number, number], other: [number, number], over: Parti
 const HITS: Genre[] = ['rap-fr', 'rap-us', 'rnb', 'pop', 'latino', 'reggaeton', 'dancehall', 'afro', '80s', '90s', '2000s', 'rock', 'funk', 'disco'];
 
 export const STYLE_PROFILES: Record<StyleProfileId, StyleProfile> = {
+  soiree: {
+    id: 'soiree',
+    label: 'Soirée',
+    description: 'DJ de soirée qui fait le show : morceaux courts, entrée sur le refrain ou le drop, drop swaps, loop-rolls, coupes sur le 1.',
+    techniqueWeights: {
+      'same-genre': { 'loop-roll': 3, 'riser-drop': 2, 'echo-out': 2, cut: 2, 'bass-swap': 3, 'long-blend': 0.5 },
+      'genre-change': { 'loop-roll': 3, 'riser-drop': 3, 'echo-out': 3, cut: 2 },
+      'tempo-jump': { 'loop-roll': 4, 'echo-out': 3, cut: 2, 'riser-drop': 1 },
+      breakdown: { 'riser-drop': 2, 'echo-out': 2, 'loop-roll': 2, 'reverb-wash': 1 },
+      outro: { 'bass-swap': 3, 'echo-out': 2, 'loop-roll': 2 },
+      emergency: { 'echo-out': 2, cut: 2, 'loop-roll': 1 },
+    },
+    transitionBeats: {
+      'long-blend': [16, 32], 'bass-swap': [8, 16], 'filter-swap': [8, 16], 'echo-out': [4, 8], cut: [1, 1],
+      'riser-drop': [8, 8], 'reverb-wash': [8, 8], 'loop-roll': [4, 8], brake: [2, 2],
+    },
+    typicalTransitionBeats: 8,
+    fxDensity: 0.6,
+    fxEveryPhrases: 2,
+    fxWeights: { loop: 3, 'loop-roll': 2, 'echo-throw': 2, 'low-cut': 2, 'filter-sweep': 1, 'reverb-throw': 0.5, riser: 0.5 },
+    allowRiser: true,
+    allowGate: true,
+    riserOnlyOnGenreChangeOrPeak: false,
+    playSeconds: playMap([90, 180], [60, 120], Object.fromEntries(HITS.map((g) => [g, [45, 90]]))),
+    bridgePlayFactor: 0.8,
+    playFullChance: 0,
+    bpmRange: [120, 126],
+    bpmRampMinutes: 240,
+    energyCurve: [[0, 0.6], [60, 0.75], [150, 0.9], [300, 0.85]],
+    genreDwellMinutes: 5,
+    maxDirectJumpCost: 3,
+    rateRelaxBeats: 32,
+    maxIntensity: 0.9,
+    followPartyTempo: true,
+    reEditChance: 0.4,
+    reEditMaxDelta: 0.3,
+    reEditCooldownTracks: 3,
+    buildPushChance: 0.3,
+    incomingEntry: 'hot',
+    dropSwapChance: 0.45,
+    funnyDropChance: 0.3,
+    rollWithoutGrid: true,
+  },
   'paris-tech-house': {
     id: 'paris-tech-house',
     label: 'Paris tech house',
@@ -112,6 +163,10 @@ export const STYLE_PROFILES: Record<StyleProfileId, StyleProfile> = {
     reEditMaxDelta: 0.3,
     reEditCooldownTracks: 4,
     buildPushChance: 0.15,
+    incomingEntry: 'intro',
+    dropSwapChance: 0,
+    funnyDropChance: 0,
+    rollWithoutGrid: false,
   },
   'open-format': {
     id: 'open-format',
@@ -151,6 +206,10 @@ export const STYLE_PROFILES: Record<StyleProfileId, StyleProfile> = {
     reEditMaxDelta: 0.3,
     reEditCooldownTracks: 2,
     buildPushChance: 0.2,
+    incomingEntry: 'intro',
+    dropSwapChance: 0.15,
+    funnyDropChance: 0.1,
+    rollWithoutGrid: true,
   },
   lounge: {
     id: 'lounge',
@@ -190,6 +249,10 @@ export const STYLE_PROFILES: Record<StyleProfileId, StyleProfile> = {
     reEditMaxDelta: 0.08,
     reEditCooldownTracks: 6,
     buildPushChance: 0,
+    incomingEntry: 'intro',
+    dropSwapChance: 0,
+    funnyDropChance: 0,
+    rollWithoutGrid: false,
   },
   'peak-time': {
     id: 'peak-time',
@@ -229,14 +292,18 @@ export const STYLE_PROFILES: Record<StyleProfileId, StyleProfile> = {
     reEditMaxDelta: 0.3,
     reEditCooldownTracks: 3,
     buildPushChance: 0.5,
+    incomingEntry: 'intro',
+    dropSwapChance: 0.2,
+    funnyDropChance: 0.1,
+    rollWithoutGrid: true,
   },
 };
 
 export const DEFAULT_SETTINGS: DjSettings = {
-  style: 'paris-tech-house',
+  style: 'soiree',
   fxAmount: 0.5,
   minPlaySeconds: 30,
-  maxPlaySeconds: 420,
+  maxPlaySeconds: 180,
   followCrowd: true,
   baseGenre: 'tech-house',
   allowReEdits: true,

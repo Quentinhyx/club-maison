@@ -9,6 +9,16 @@ export interface CandidateInfo {
   genre?: Genre;
   source: 'queue' | 'candidate';
   queueSource?: QueueItem['source'];
+  /** Origine du candidat : catalogue du genre, ou 'similar' (radio / artistes proches du morceau en cours). */
+  candidateSource?: 'catalog' | 'similar';
+}
+
+/** Morceau zappé : sert à pénaliser ce qui lui ressemble pendant une heure. */
+export interface SkipMark { atMs: number; genre?: Genre; artist: string; bpm: number; energy: number }
+
+/** Clé d'artiste : id Deezer si connu, sinon le nom en minuscules. */
+export function artistKey(t: TrackRef): string {
+  return t.artistId !== undefined ? `id:${t.artistId}` : t.artist.toLowerCase();
 }
 
 export interface ScoreContext {
@@ -31,6 +41,14 @@ export interface ScoreContext {
   /** Morceaux déjà sur une platine / mauvais. */
   excludeIds: ReadonlySet<number>;
   allowArtistRepeat?: boolean;
+  /** Artistes des 6 derniers morceaux (pas plus de 2 fois le même). */
+  recentArtists6?: readonly string[];
+  /** Artistes zappés : clé -> Date.now() jusqu'auquel ils sont exclus. */
+  bannedArtists?: ReadonlyMap<string, number>;
+  /** Zappages récents : pénalité sur ce qui ressemble (genre + énergie + tempo proches). */
+  skips?: readonly SkipMark[];
+  /** Bonus des candidats 'similar' (radio de l'artiste en cours) à tempo et énergie proches. */
+  similarBonus?: number;
   random?: () => number;
 }
 
@@ -91,8 +109,12 @@ export function scoreCandidate(c: CandidateInfo, ctx: ScoreContext): ScoreResult
   if (!isHost && genres.some((g) => ctx.blockedGenres.has(g))) return fail('genre bloqué');
   const last = ctx.recentPlays.get(id);
   if (!isHost && last !== undefined && ctx.nowMs - last < REPLAY_WINDOW_MS) return fail('joué il y a moins de 2 h');
-  if (c.source === 'candidate' && !ctx.allowArtistRepeat && ctx.recentArtists.includes(c.track.artist.toLowerCase())) {
-    return fail('artiste joué récemment');
+  const ak = artistKey(c.track);
+  const banUntil = ctx.bannedArtists?.get(ak);
+  if (!isHost && banUntil !== undefined && ctx.nowMs < banUntil) return fail('artiste zappé il y a moins d’une heure');
+  if (c.source === 'candidate' && !ctx.allowArtistRepeat) {
+    if (ctx.recentArtists.includes(ak)) return fail('artiste joué récemment');
+    if ((ctx.recentArtists6 ?? []).filter((x) => x === ak).length >= 2) return fail('artiste déjà passé 2 fois sur les 6 derniers');
   }
 
   const bpm = bpmOf(c);
@@ -120,7 +142,19 @@ export function scoreCandidate(c: CandidateInfo, ctx: ScoreContext): ScoreResult
   if (c.track.rank !== undefined) parts.popularity = Math.min(1, c.track.rank / 900000);
 
   const jitter = ctx.random ? ctx.random() * 0.04 : 0;
-  const score = 0.3 * parts.genre + 0.22 * parts.tempo + 0.18 * parts.harmony + 0.2 * parts.energy
+  let score = 0.3 * parts.genre + 0.22 * parts.tempo + 0.18 * parts.harmony + 0.2 * parts.energy
     + 0.05 * parts.bpmTarget + 0.05 * parts.popularity + jitter;
+  if (c.candidateSource === 'similar' && ctx.similarBonus) {
+    score += parts.tempo >= 0.6 && parts.energy >= 0.6 ? ctx.similarBonus : ctx.similarBonus * 0.3;
+  }
+  let penalty = 0;
+  for (const sk of ctx.skips ?? []) {
+    if (ctx.nowMs - sk.atMs > 3600_000) continue;
+    const sameGenre = !!g && g === sk.genre;
+    const close = Math.abs(energy - sk.energy) < 0.12 && tempoMatch(sk.bpm, bpm).pct < 0.04;
+    if (sameGenre && close) penalty += 0.15;
+    else if (sameGenre) penalty += 0.04;
+  }
+  score -= Math.min(0.3, penalty);
   return { score, tempoPct, parts };
 }

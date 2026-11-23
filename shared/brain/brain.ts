@@ -17,14 +17,14 @@
  */
 import type {
   BrainDecision, BrainInput, DeckId, DeckState, DjBrain, DjSettings, FxCue, FxKind, Genre, GroovePlan, GrooveStyle, QueueItem,
-  Section, TrackAnalysis, TrackRef, TransitionPlan, TransitionTechnique,
+  Section, TrackAnalysis, TrackRef, TrackStructure, TransitionPlan, TransitionTechnique,
 } from '../contracts';
 import { GENRE_LABELS, RATE_LIMITS } from '../contracts';
 import { GENRE_BPM, GENRE_GRAPH, genrePath, genrePathCost, isElectronic } from './genres';
 import { checkReEdit, grooveStyleFor, partyRate, REEDIT_GENRES, type ReEditCheck } from './tempo';
 import { harmonicScore } from './harmony';
 import { energyAt, STYLE_PROFILES, targetBpmAt, type StyleProfile, type TransitionSituation } from './profiles';
-import { bpmOf, primaryGenre, scoreCandidate, tempoMatch, type CandidateInfo, type ScoreContext } from './scoring';
+import { artistKey, bpmOf, primaryGenre, scoreCandidate, tempoMatch, type CandidateInfo, type ScoreContext, type SkipMark } from './scoring';
 import { chooseTechnique, needsSync, pickBeats, weightedPick } from './technique';
 
 /** En dessous, la grille de temps du live n'est pas fiable : pas de calage, grille de l'analyse. */
@@ -33,6 +33,8 @@ export const BEAT_CONFIDENCE_MIN = 0.5;
 export const GUEST_MAX_WAIT_MS = 15 * 60 * 1000;
 export const GUEST_FIT_SCORE = 0.55;
 const WANT_GENRE_COOLDOWN_MS = 20_000;
+/** La platine Deezer doit avoir le temps de charger : 'load' au moins 20 s avant la transition. */
+export const MIN_LOAD_LEAD_S = 20;
 const MIN_CANDIDATES = 3;
 /** Inertie des votes : part minimale du genre en tête, et avance sur le genre visé actuel. */
 const VOTE_SHARE_MIN = 0.4;
@@ -56,7 +58,7 @@ interface Pick {
   why: string;
 }
 type ReEdit = ReEditCheck & { style: GrooveStyle; text: string };
-interface Planned extends Pick { deck: DeckId; startAt: number; reEdit?: ReEdit; reEditWanted?: boolean }
+interface Planned extends Pick { deck: DeckId; startAt: number; reEdit?: ReEdit; reEditWanted?: boolean; loadedAtCtx: number; structureUsed?: boolean }
 interface Current {
   deck: DeckId;
   track: TrackRef;
@@ -73,7 +75,7 @@ interface Current {
 }
 interface GrooveState { deck: DeckId; plan: GroovePlan; stage: 1 | 2; lastUpdateCtx: number; wantBass: boolean }
 interface Running { plan: TransitionPlan; endCtx: number; incoming: Planned; hadOutgoing: boolean }
-interface Grid { bpm: number; beatLen: number; phraseBeats: number; phraseLen: number; nextPhrase: number; reliable: boolean }
+interface Grid { bpm: number; beatLen: number; phraseBeats: number; phraseLen: number; nextPhrase: number; reliable: boolean; fromStructure?: boolean }
 interface TickEnv { profile: StyleProfile; targetEnergy: number; targetBpm: number; blockedGenres: Set<Genre>; blockedIds: Set<number>; recentPlays: Map<number, number> }
 
 interface State {
@@ -99,6 +101,13 @@ interface State {
   /** Action sur le groove à faire après la fin de la transition (jamais pendant : la table automatise eqLow). */
   pendingGroove?: 'start' | 'stop-after';
   lastRatePhrase: number;
+  /** Zappages (« suivant ») : dernière valeur vue, avis négatifs, artistes exclus, genre à éviter. */
+  lastSkipSeen?: number;
+  skips: SkipMark[];
+  bannedArtists: Map<string, number>;
+  avoidGenre?: { genre: Genre; untilMs: number };
+  /** 'stop' différé : l'entrant n'est pas encore parti (la table boucle le sortant). */
+  pendingStop?: DeckId;
   tracksSinceReEdit: number;
   reEditCount: number;
 }
@@ -118,7 +127,16 @@ const trackName = (t: TrackRef) => `${t.artist} - ${t.title}`;
  *    morceau ; les techniques choisies pour ces genres (cut, echo-out) font tomber l'entrant sur le 1.
  *  - sinon 0.
  */
-export function chooseStartAt(track: TrackRef, genre: Genre | undefined, bpm: number, profile: StyleProfile, expectedPlay: number): number {
+export function chooseStartAt(track: TrackRef, genre: Genre | undefined, bpm: number, profile: StyleProfile, expectedPlay: number,
+  analysis?: TrackAnalysis): number {
+  if (profile.incomingEntry === 'hot' || usableStructure(analysis)) {
+    // Profil « soirée » ou structure connue : on prépare l'entrée sur le moment fort (drop / refrain).
+    const e = chooseEntryPoint({
+      structure: usableStructure(analysis), kind: 'drop', duration: track.duration, bpm, genre, energy: analysis?.energy,
+      hot: profile.incomingEntry === 'hot', longPlay: wantsLongPlay(profile, genre, track.duration), trackId: track.id,
+    });
+    if (e.pos >= 0) return e.pos;
+  }
   if (!genre || isElectronic(genre)) return 0;
   if (track.duration < 120) return 0;
   const shortPlay = expectedPlay < 100 || profile.id === 'open-format' || profile.id === 'peak-time';
@@ -126,6 +144,129 @@ export function chooseStartAt(track: TrackRef, genre: Genre | undefined, bpm: nu
   const intro = (16 * 60) / bpm;
   if (intro > track.duration * 0.15) return 0;
   return Math.round(intro * 1000) / 1000;
+}
+
+/** Structure utilisable (scan du morceau complet) : confiance >= 0,5. */
+export const STRUCTURE_MIN_CONFIDENCE = 0.5;
+export function usableStructure(a?: TrackAnalysis): TrackStructure | undefined {
+  const st = a?.structure;
+  return st && st.confidence >= STRUCTURE_MIN_CONFIDENCE && st.bpm > 0 ? st : undefined;
+}
+
+function sectionAt(st: TrackStructure, pos: number): Section | undefined {
+  return st.sections.find((x) => x.startPos <= pos && pos < x.endPos)?.section;
+}
+
+function wantsLongPlay(profile: StyleProfile, genre: Genre | undefined, duration: number): boolean {
+  const [a, b] = profile.playSeconds[genre ?? 'house'];
+  return (a + b) / 2 >= 150 && duration >= 300;
+}
+
+/** Ce que l'entrant doit faire au moment où il entre, selon ce que fait le sortant. */
+export type EntryKind = 'drop' | 'build' | 'rhythmic';
+
+/**
+ * Accord des sections : sortant en fin de drop/refrain (ou drop swap) -> entrant sur son drop ;
+ * sortant en breakdown ou en montée -> entrant au début de SA montée (les deux tensions montent
+ * ensemble, son drop tombe en fin de phrase) ; sortant en outro -> phrase rythmique (intro/couplet).
+ * Couplet : drop dans le profil soirée, phrase rythmique sinon.
+ */
+export function entryKindFor(endSection: Section, dropSwap: boolean, hot: boolean): EntryKind {
+  if (dropSwap) return 'drop';
+  switch (endSection) {
+    case 'drop': return 'drop';
+    case 'breakdown': case 'build': return 'build';
+    case 'outro': return 'rhythmic';
+    default: return hot ? 'drop' : 'rhythmic';
+  }
+}
+
+export interface EntryPointInput {
+  structure?: TrackStructure;
+  kind: EntryKind;
+  duration: number;
+  /** Tempo d'analyse (sert à l'heuristique sans structure). */
+  bpm: number;
+  genre?: Genre;
+  energy?: number;
+  /** Profil qui veut entrer sur un moment fort (soirée). */
+  hot: boolean;
+  /** Profil qui fait durer les morceaux : on prend le premier drop plutôt que le plus marquant. */
+  longPlay: boolean;
+  trackId: number;
+}
+
+/**
+ * Point d'entrée dans le morceau entrant (s), toujours un début de phrase, borné à [0, durée - 60 s].
+ *  - Structure connue : drop = dropPositions[0] (ou le premier drop si longPlay) ; montée = section
+ *    'build' qui précède ce drop (sinon une phrase avant) ; rythmique = premier couplet ('body'),
+ *    sinon intro. Alignement sur firstDownbeatPos + k × phraseBeats × 60/bpm.
+ *  - Sans structure, profil « hot » (heuristique par genre, le morceau complet n'est pas analysé) :
+ *    électronique : drop au temps 32 (morceau < 5 min) ou 64 ; montée 32 temps avant ; rythmique au temps 32.
+ *    pop / rap / 80s / latino / R&B... : refrain vers 25-35 % de la durée, arrondi à 4 mesures ; montée
+ *    16 temps avant ; rythmique vers 12 %. Genre inconnu et extrait énergique : 30 %. Jamais 0.
+ *  - Sans structure, autre profil : -1 (on garde le point de départ du chargement).
+ * En profil soirée, jamais la position 0, sauf si le morceau commence directement fort.
+ */
+export function chooseEntryPoint(o: EntryPointInput): { pos: number; label: string } {
+  const maxPos = Math.max(0, o.duration - 60);
+  const electro = isElectronic(o.genre);
+  const dropWord = electro || !o.genre ? 'son drop' : 'son refrain';
+  const labels: Record<EntryKind, string> = { drop: dropWord, build: 'sa montée', rhythmic: 'une phrase rythmique' };
+  const st = o.structure;
+  if (st) {
+    const nb = 60 / st.bpm;
+    const phrase = st.phraseBeats * nb;
+    const align = (x: number, mode: 'round' | 'floor' = 'round') => {
+      const k = (x - st.firstDownbeatPos) / phrase;
+      return st.firstDownbeatPos + (mode === 'round' ? Math.round(k) : Math.floor(k + 1e-6)) * phrase;
+    };
+    const drops = st.dropPositions.filter((x) => x >= 0 && x <= maxPos);
+    if (drops.length === 0) {
+      const d = st.sections.find((x) => x.section === 'drop' && x.startPos <= maxPos);
+      if (d) drops.push(d.startPos);
+    }
+    const drop = drops.length ? (o.longPlay ? Math.min(...drops) : drops[0]) : undefined;
+    let pos: number;
+    if (o.kind === 'drop' && drop !== undefined) pos = align(drop);
+    else if (o.kind === 'build' && drop !== undefined) {
+      const builds = st.sections.filter((x) => x.section === 'build' && x.startPos < drop);
+      const b = builds.find((x) => Math.abs(x.endPos - drop) < phrase) ?? builds[builds.length - 1];
+      pos = b ? align(b.startPos) : align(drop - phrase);
+    } else {
+      const body = st.sections.find((x) => x.section === 'body' && x.startPos <= maxPos);
+      pos = body ? align(body.startPos) : st.firstDownbeatPos + (o.hot ? phrase : 0);
+    }
+    if (o.hot && pos < nb) {
+      const first = st.sections[0];
+      const strong = !!first && (first.section === 'drop' || first.section === 'body') && first.energy >= 0.7;
+      if (!strong) pos = st.firstDownbeatPos + phrase;
+    }
+    while (pos > maxPos && pos - phrase >= 0) pos -= phrase;
+    pos = Math.max(0, Math.min(pos, maxPos));
+    return { pos: Math.round(pos * 1000) / 1000, label: labels[o.kind] };
+  }
+  if (!o.hot) return { pos: -1, label: labels[o.kind] };
+  const nb = 60 / o.bpm;
+  const bar4 = 16 * nb; // 4 mesures
+  const roundTo = (x: number, q: number) => Math.round(x / q) * q;
+  let drop: number;
+  if (electro) drop = (o.duration >= 300 ? 64 : 32) * nb;
+  else if (o.genre) drop = roundTo(o.duration * (0.25 + 0.1 * (((o.trackId * 7919) % 100) / 100)), bar4);
+  else drop = (o.energy ?? 0) >= 0.7 ? roundTo(o.duration * 0.3, bar4) : 32 * nb;
+  let pos: number;
+  if (o.kind === 'drop') pos = drop;
+  else if (o.kind === 'build') pos = drop - (electro ? 32 : 16) * nb;
+  else pos = electro ? 32 * nb : roundTo(o.duration * 0.12, bar4);
+  if (pos < bar4) pos = Math.min(bar4, maxPos);
+  pos = Math.max(0, Math.min(pos, maxPos));
+  return { pos: Math.round(pos * 1000) / 1000, label: labels[o.kind] };
+}
+
+function mmss(pos: number): string {
+  const m = Math.floor(pos / 60);
+  const s = Math.floor(pos % 60);
+  return `${m}:${s.toString().padStart(2, '0')}`;
 }
 
 /** Raison de sortir au prochain début de phrase, selon la section qui se termine et la durée jouée. */
@@ -147,7 +288,7 @@ function initialState(): State {
     targetSince: 0, path: [], lastEvalS: -Infinity, lastFxCtx: -Infinity,
     analyses: new Map(), analyzeAsked: new Set(), wantAsked: new Map(), plays: new Map(),
     artists: [], badIds: new Set(), logged: new Set(), planCounter: 0,
-    lastRatePhrase: -Infinity, tracksSinceReEdit: Infinity, reEditCount: 0,
+    lastRatePhrase: -Infinity, tracksSinceReEdit: Infinity, reEditCount: 0, skips: [], bannedArtists: new Map(),
   };
 }
 
@@ -167,6 +308,12 @@ class Brain implements DjBrain {
     this.ingest(input);
     this.env = this.makeEnv(input);
     this.adopt(input, out);
+    const skip = input.skipRequestedAt;
+    if (skip !== undefined && skip !== s.lastSkipSeen) {
+      const first = s.lastSkipSeen === undefined && !s.current && !s.running;
+      s.lastSkipSeen = skip;
+      if (!first) this.handleSkip(input, out);
+    }
     this.updateTarget(input, out);
     const step = this.computeStep(out);
     this.requests(input, step, out);
@@ -174,6 +321,10 @@ class Brain implements DjBrain {
     if (s.running) {
       if (input.nowCtx >= s.running.endCtx) this.finish(input, out);
       else return out;
+    }
+    if (s.pendingStop && s.current && input.decks[s.current.deck].status === 'playing') {
+      out.push({ type: 'stop', deck: s.pendingStop });
+      s.pendingStop = undefined;
     }
     if (input.activeTransition) return out; // une transition qu'on n'a pas lancée : on attend
     if (s.current) this.checkCurrentAlive(input, out);
@@ -224,6 +375,126 @@ class Brain implements DjBrain {
     };
   }
 
+  /** File vide et aucun vote : le public ne pilote pas, on continue dans le même registre. */
+  private crowdIdle(input: BrainInput): boolean {
+    if (input.queue.length > 0) return false;
+    const w = Object.values(input.crowd.genreWeights ?? {}).reduce((a: number, x) => a + (x ?? 0), 0);
+    return w < 0.3;
+  }
+
+  // ------------------------------------------------------------------ zappage (« suivant »)
+
+  /**
+   * Suivant demandé : sortie au plus vite (prochaine mesure, ou prochain temps si la mesure est à plus
+   * de 3 s), technique courte, minPlaySeconds ignoré. Transition en cours : raccourcie, jamais doublée.
+   * Puis avis négatif : artiste exclu 1 h, pénalité sur ce qui ressemble, changement de genre après
+   * 2 zappages dans le même genre en moins de 10 min, morceau préparé remplacé s'il ressemble trop.
+   */
+  private handleSkip(input: BrainInput, out: BrainDecision[]): void {
+    const s = this.s;
+    const now = input.nowCtx;
+    if (s.running) {
+      const r = s.running;
+      const bl = 60 / r.plan.bpm;
+      const elapsed = Math.max(0, now - r.plan.startCtx);
+      const nb = Math.max(2, Math.ceil(elapsed / bl) + 2);
+      if (nb < r.plan.beats) {
+        const end = r.plan.startCtx + nb * bl;
+        const plan: TransitionPlan = {
+          ...r.plan, beats: nb, incomingStartCtx: Math.min(r.plan.incomingStartCtx, end),
+          accents: r.plan.accents.filter((a) => a.atCtx < end), reason: `${r.plan.reason} ; suivant demandé : transition raccourcie à ${nb} temps`,
+        };
+        r.plan = plan;
+        r.endCtx = end;
+        out.push({ type: 'transition', plan });
+        this.log(out, `Suivant demandé pendant la transition : je la raccourcis à ${nb} temps`);
+      } else this.log(out, 'Suivant demandé : la transition se termine déjà');
+      return;
+    }
+    const cur = s.current;
+    if (!cur) return;
+    const genreChanged = this.rememberSkip(input, cur, out);
+    // morceau préparé : remplacé s'il ressemble trop au zappé ou si rien n'est prêt
+    const ctx = this.scoreCtx(input, s.target ?? input.settings.baseGenre);
+    let p = s.planned;
+    const resembles = (x: Planned) => {
+      if (scoreCandidate({ ...this.info(x.track, x.genre, x.source, x.queueSource) }, { ...ctx, excludeIds: new Set() }).excluded) return true;
+      const sk = s.skips[s.skips.length - 1];
+      const e = x.analysis?.energy ?? 0.6;
+      if (x.source !== 'candidate') return false;
+      if (genreChanged && x.genre !== s.target) return true;
+      return x.genre === sk.genre && Math.abs(e - sk.energy) < 0.12 && tempoMatch(sk.bpm, bpmOf(x)).pct < 0.04;
+    };
+    if (!p || resembles(p)) {
+      // meilleur candidat déjà analysé (chargeable tout de suite)
+      const analysed = { ...input, candidates: input.candidates.filter((c) => c.analysis || s.analyses.has(c.track.id)) };
+      const next = (p ? undefined : this.pickFromQueue(input, ctx, out).pick) ?? this.pickCandidate(analysed, ctx);
+      if (next && (!p || next.track.id !== p.track.id)) {
+        const deck: DeckId = p?.deck ?? other(cur.deck);
+        this.emitLoad(input, next, deck, 'Suivant demandé', out);
+        p = s.planned;
+      }
+    }
+    if (!p) { this.log(out, 'Suivant demandé, mais aucun morceau disponible pour enchaîner'); return; }
+    p.reEdit = undefined;
+    s.pendingGroove = undefined;
+    const d = input.decks[cur.deck];
+    const g = this.grid(d, cur, now);
+    const bar = 4 * g.beatLen;
+    let T = g.nextPhrase - Math.floor((g.nextPhrase - now) / bar) * bar;
+    while (T - now < 0.15) T += bar;
+    if (T - now > 3) {
+      T = g.nextPhrase - Math.floor((g.nextPhrase - now) / g.beatLen) * g.beatLen;
+      while (T - now < 0.1) T += g.beatLen;
+    }
+    const w: Partial<Record<TransitionTechnique, number>> = { 'echo-out': 3, cut: 2 };
+    if (this.env.profile.allowGate || this.env.profile.rollWithoutGrid) w['loop-roll'] = 2;
+    const technique = weightedPick(w, this.random) ?? 'echo-out';
+    const beats = technique === 'cut' ? 1 : 4;
+    const incomingStartCtx = technique === 'cut' ? T : T + beats * g.beatLen;
+    const inAna = p.analysis ?? s.analyses.get(p.track.id);
+    const hot = this.env.profile.incomingEntry === 'hot';
+    const e = chooseEntryPoint({
+      structure: usableStructure(inAna), kind: 'drop', duration: p.track.duration, bpm: bpmOf({ ...p, analysis: inAna }), genre: p.genre,
+      energy: inAna?.energy, hot, longPlay: false, trackId: p.track.id,
+    });
+    this.stopGroove(now, 0, out);
+    const techLabel = technique === 'cut' ? 'coupe sur le 1' : technique === 'loop-roll' ? 'loop-roll de 4 temps' : 'echo-out';
+    const where = T - now > 3 ? 'le prochain temps' : 'la prochaine mesure';
+    const accents: FxCue[] = technique === 'loop-roll'
+      ? [{ kind: 'loop-roll', target: cur.deck, atCtx: T, beats, bpm: g.bpm, loopBeats: 1, amount: 0.7, reason: 'boucle qui raccourcit (suivant demandé)' }] : [];
+    const plan: TransitionPlan = {
+      id: this.planId(p), from: cur.deck, to: p.deck, technique, startCtx: T, beats, bpm: g.bpm,
+      incomingStartCtx, incomingStartPos: e.pos >= 0 ? e.pos : p.startAt, incomingRate: 1, accents,
+      intensity: Math.min(0.6, input.settings.fxAmount), preRollBeats: 0, holdWithLoop: true,
+      reason: `Suivant demandé : sortie en ${techLabel} sur ${where}. Je m'éloigne de ${cur.track.artist}`,
+    };
+    this.commit(input, plan, p, true, out);
+  }
+
+  private rememberSkip(input: BrainInput, cur: Current, out: BrainDecision[]): boolean {
+    const s = this.s;
+    const nowMs = input.nowMs;
+    s.bannedArtists.set(artistKey(cur.track), nowMs + 3600_000);
+    s.skips.push({ atMs: nowMs, genre: cur.genre, artist: artistKey(cur.track), bpm: bpmOf(cur), energy: cur.analysis?.energy ?? 0.6 });
+    s.skips = s.skips.filter((x) => nowMs - x.atMs < 3600_000);
+    const sameGenre = s.skips.filter((x) => x.genre && x.genre === cur.genre && nowMs - x.atMs < 10 * 60000).length;
+    if (cur.genre && sameGenre >= 2) {
+      const blocked = this.env.blockedGenres;
+      const neighbours = (Object.entries(GENRE_GRAPH[cur.genre]) as Array<[Genre, number]>)
+        .filter(([g]) => !blocked.has(g)).sort((a, b) => a[1] - b[1]);
+      const ng = neighbours[0]?.[0];
+      if (ng) {
+        s.avoidGenre = { genre: cur.genre, untilMs: nowMs + 20 * 60000 };
+        s.target = ng;
+        s.targetSince = nowMs;
+        this.log(out, `${sameGenre} zappages en ${label(cur.genre)} en moins de 10 min : je change de registre vers ${label(ng)}`);
+        return true;
+      }
+    }
+    return false;
+  }
+
   private log(out: BrainDecision[], message: string): void { out.push({ type: 'log', message }); }
   private logOnce(out: BrainDecision[], key: string, message: string): void {
     if (this.s.logged.has(key)) return;
@@ -255,6 +526,8 @@ class Brain implements DjBrain {
     const cur = this.s.current!;
     const d = input.decks[cur.deck];
     if (d.track?.id === cur.track.id && (d.status === 'playing' || d.status === 'paused')) return;
+    // la table tient le sortant en boucle tant que l'entrant n'est pas réellement parti (holdWithLoop)
+    if (d.track?.id === cur.track.id && (d.status === 'loading' || d.status === 'ready')) return;
     this.log(out, `Le morceau ${trackName(cur.track)} s'est arrêté (${d.status}) : on relance la suite`);
     this.stopGroove(input.nowCtx, 0, out);
     this.s.current = undefined;
@@ -262,7 +535,7 @@ class Brain implements DjBrain {
   }
 
   private pushArtist(t: TrackRef): void {
-    this.s.artists.push(t.artist.toLowerCase());
+    this.s.artists.push(artistKey(t));
     if (this.s.artists.length > 10) this.s.artists.shift();
   }
 
@@ -290,7 +563,13 @@ class Brain implements DjBrain {
         const [top, wTop] = entries[0];
         const wCur = s.target ? (crowd.genreWeights[s.target] ?? 0) : 0;
         if (top !== s.target && wTop / total >= VOTE_SHARE_MIN && wTop >= wCur * VOTE_LEAD) desired = top;
-      } else if (total < 0.3) desired = settings.baseGenre; // plus personne ne vote : retour au genre de base
+      } else if (total < 0.3) {
+        // Personne ne vote : on reste dans le registre du morceau en cours (pas de dérive vers baseGenre),
+        // sauf s'il vient d'être zappé deux fois (genre évité).
+        const cg = s.current?.genre;
+        const avoided = s.avoidGenre && input.nowMs < s.avoidGenre.untilMs ? s.avoidGenre.genre : undefined;
+        desired = cg && cg !== avoided && !blocked.has(cg) ? cg : s.target ?? settings.baseGenre;
+      }
     } else desired = settings.baseGenre;
     if (blocked.has(desired)) desired = s.target && !blocked.has(s.target) ? s.target : settings.baseGenre;
     if (s.target === undefined) {
@@ -366,6 +645,10 @@ class Brain implements DjBrain {
       recentPlays: this.env.recentPlays,
       nowMs: input.nowMs,
       recentArtists: s.artists.slice(-3),
+      recentArtists6: s.artists.slice(-6),
+      bannedArtists: s.bannedArtists,
+      skips: s.skips,
+      similarBonus: this.crowdIdle(input) ? 0.15 : 0.05,
       excludeIds,
       random: this.random,
     };
@@ -451,7 +734,7 @@ class Brain implements DjBrain {
       let best: Pick | undefined;
       const c2 = { ...ctx, allowArtistRepeat };
       for (const c of input.candidates) {
-        const info = this.info(c.track, c.genre, 'candidate');
+        const info = { ...this.info(c.track, c.genre, 'candidate'), candidateSource: c.source };
         const r = scoreCandidate(info, c2);
         if (r.excluded) continue;
         if (!best || r.score > best.score) best = { ...info, score: r.score, why: '' };
@@ -481,9 +764,25 @@ class Brain implements DjBrain {
       } else if (s.current && s.planned.deck === s.current.deck) s.planned = undefined;
     }
     const pl = s.planned;
-    if (pl && !pl.analysis && s.analyses.has(pl.track.id)) {
-      pl.analysis = s.analyses.get(pl.track.id);
-      if (pl.reEditWanted) pl.reEdit = this.checkPlannedReEdit(input, { ...pl, analysis: pl.analysis! }, pl.deck, out);
+    const cached = pl ? s.analyses.get(pl.track.id) : undefined;
+    if (pl && cached && cached !== pl.analysis) {
+      const first = !pl.analysis;
+      pl.analysis = cached;
+      if (first && pl.reEditWanted) pl.reEdit = this.checkPlannedReEdit(input, { ...pl, analysis: cached }, pl.deck, out);
+    }
+    if (pl && !pl.structureUsed && usableStructure(pl.analysis)) {
+      // La structure arrive après le chargement : on recale le point de départ sur le vrai drop.
+      pl.structureUsed = true;
+      const bpm = bpmOf(pl);
+      const range = this.env.profile.playSeconds[pl.genre ?? 'house'];
+      const ns = chooseStartAt(pl.track, pl.genre, bpm, this.env.profile, (range[0] + range[1]) / 2, pl.analysis);
+      if (Math.abs(ns - pl.startAt) > 60 / bpm) {
+        pl.startAt = ns;
+        pl.loadedAtCtx = input.nowCtx;
+        const reason = `Structure reçue : ${trackName(pl.track)} préparé sur son drop (${mmss(ns)})`;
+        out.push({ type: 'load', deck: pl.deck, track: pl.track, startAt: ns, reason });
+        this.log(out, reason);
+      }
     }
     const { pick: q, fallback } = this.pickFromQueue(input, ctx, out);
     const p = s.planned;
@@ -516,11 +815,11 @@ class Brain implements DjBrain {
     const profile = this.env.profile;
     const bpm = bpmOf(pick);
     const range = profile.playSeconds[pick.genre ?? 'house'];
-    const startAt = chooseStartAt(pick.track, pick.genre, bpm, profile, (range[0] + range[1]) / 2);
-    const wanted = this.wantReEdit(pick);
     const analysis = pick.analysis ?? this.s.analyses.get(pick.track.id);
+    const startAt = chooseStartAt(pick.track, pick.genre, bpm, profile, (range[0] + range[1]) / 2, analysis);
+    const wanted = this.wantReEdit(pick);
     const reEdit = wanted && analysis ? this.checkPlannedReEdit(input, { ...pick, analysis }, deck, out) : undefined;
-    this.s.planned = { ...pick, analysis, deck, startAt, reEdit, reEditWanted: wanted };
+    this.s.planned = { ...pick, analysis, deck, startAt, reEdit, reEditWanted: wanted, loadedAtCtx: input.nowCtx, structureUsed: !!usableStructure(analysis) };
     const reason = `${why ? `${why} : ` : ''}${pick.why}${reEdit ? ', prévu en re-edit' : ''}`;
     out.push({ type: 'load', deck, track: pick.track, startAt, reason });
     this.log(out, `Platine ${deck} : ${trackName(pick.track)} (${label(pick.genre)}, ${r0(bpm)} BPM${startAt > 0 ? `, départ à ${startAt.toFixed(1)} s` : ''}) ; ${reason}`);
@@ -588,6 +887,7 @@ class Brain implements DjBrain {
     const plan: TransitionPlan = {
       id: this.planId(p), from: other(p.deck), to: p.deck, technique: 'cut', startCtx, beats: 1, bpm,
       incomingStartCtx: startCtx, incomingStartPos: p.startAt, incomingRate: 1, accents: [], intensity: 0,
+      preRollBeats: 0, holdWithLoop: true,
       reason: `Ouverture : ${trackName(p.track)} (${label(p.genre)}, ${r0(bpm)} BPM)`,
     };
     this.commit(input, plan, p, false, out);
@@ -607,7 +907,10 @@ class Brain implements DjBrain {
   private finish(input: BrainInput, out: BrainDecision[]): void {
     const s = this.s;
     const r = s.running!;
-    if (r.hadOutgoing) out.push({ type: 'stop', deck: r.plan.from });
+    if (r.hadOutgoing) {
+      if (input.decks[r.plan.to].status === 'playing') out.push({ type: 'stop', deck: r.plan.from });
+      else s.pendingStop = r.plan.from;
+    }
     if (r.incoming.source === 'queue') out.push({ type: 'consume-queue', trackId: r.incoming.track.id });
     const bridge = !!r.incoming.genre && r.incoming.genre !== s.target;
     s.current = {
@@ -629,6 +932,17 @@ class Brain implements DjBrain {
       const beatLen = 60 / live.bpm;
       const phraseBeats = live.phraseBeats || 16;
       return { bpm: live.bpm, beatLen, phraseBeats, phraseLen: phraseBeats * beatLen, nextPhrase: live.nextPhraseCtx, reliable: true };
+    }
+    // Structure du morceau complet : sa grille + la position du lecteur suffisent.
+    const st = usableStructure(cur.analysis ?? d.analysis);
+    if (st) {
+      const rate = d.rate || 1;
+      const nb = 60 / st.bpm;
+      const beatLen = nb / rate;
+      const beatPos = (d.position - st.firstDownbeatPos) / nb;
+      const pb = st.phraseBeats;
+      const idx = Math.ceil(beatPos / pb - 1e-9) * pb;
+      return { bpm: st.bpm * rate, beatLen, phraseBeats: pb, phraseLen: pb * beatLen, nextPhrase: now + (idx - beatPos) * beatLen, reliable: true, fromStructure: true };
     }
     // Repli : grille du BPM d'analyse depuis le début audible (départs choisis sur des phrases).
     const bpm = bpmOf({ track: cur.track, analysis: cur.analysis, genre: cur.genre }) * (d.rate || 1);
@@ -669,15 +983,42 @@ class Brain implements DjBrain {
     const estDur = profile.typicalTransitionBeats * g.beatLen;
     const forced = S + g.phraseLen + estDur > prefEnd;
     const played = S - cur.startedCtx;
-    const section: Section = d.live?.section ?? 'unknown';
+    // Sections : structure réelle du morceau si connue, sinon live (ignoré si la grille n'est pas fiable :
+    // on sort alors à la durée visée, sans attendre la fin du morceau).
+    let endSection: Section = g.reliable ? d.live?.section ?? 'unknown' : 'unknown';
+    let section: Section = endSection;
+    let dropAhead = endSection === 'build';
+    const st = usableStructure(cur.analysis);
+    if (st) {
+      const nb = 60 / st.bpm;
+      const posS = d.position + (S - now) * rate;
+      const ending = sectionAt(st, posS - nb / 2) ?? 'unknown';
+      const next = sectionAt(st, posS + nb / 2);
+      endSection = ending;
+      section = ending;
+      dropAhead = next === 'drop' && ending !== 'drop';
+      if ((st.outroPos !== undefined && posS >= st.outroPos - nb) || next === 'outro') section = 'outro';
+      else if (next === 'breakdown' && ending !== 'breakdown') section = 'breakdown';
+    }
     let why: string | undefined;
+    let dropSwap = false;
+    const canExit = played >= settings.minPlaySeconds && S >= cur.transitionEndCtx + g.phraseLen * 0.99;
     if (forced) {
       why = S + g.phraseLen + estDur > hardEnd ? 'sortie forcée, fin du morceau proche' : 'sortie forcée, durée max atteinte';
-    } else if (played >= settings.minPlaySeconds && S >= cur.transitionEndCtx + g.phraseLen * 0.99) {
+    } else if (canExit) {
       why = exitReason(section, played / cur.playTarget);
+      if (!why && dropAhead && profile.dropSwapChance > 0 && played / cur.playTarget >= 0.7
+        && S - now >= 4.5 * g.beatLen && this.random() < profile.dropSwapChance) {
+        why = 'drop swap : la tension monte sur le sortant et c’est l’entrant qui tombe sur le 1';
+        dropSwap = true;
+      }
+    }
+    if (why && p && isReady && !forced && S - p.loadedAtCtx < MIN_LOAD_LEAD_S) {
+      this.logOnce(out, `lead:${p.track.id}:${p.loadedAtCtx}`, `On attend que ${trackName(p.track)} ait fini de charger`);
+      why = undefined;
     }
     if (why && p && isReady && S < hardEnd) {
-      const plan = this.buildPlan(input, g, S, prefEnd, hardEnd, cur, p, section, forced, why);
+      const plan = this.buildPlan(input, g, S, prefEnd, hardEnd, cur, p, section, forced, why, endSection, dropSwap);
       this.grooveAtTransition(input.nowCtx, plan, p, out); // avant la transition : rien ne doit tomber pendant
       this.commit(input, plan, p, true, out);
       return;
@@ -695,13 +1036,14 @@ class Brain implements DjBrain {
     const plan: TransitionPlan = {
       id: this.planId(p), from: cur.deck, to: p.deck, technique: 'cut', startCtx, beats: 1, bpm: g.bpm,
       incomingStartCtx: startCtx, incomingStartPos: p.startAt, incomingRate: 1, accents: [], intensity: 0,
+      preRollBeats: 0, holdWithLoop: true,
       reason: `Sortie d'urgence : ${trackName(cur.track)} se termine, coupe sèche vers ${trackName(p.track)}`,
     };
     this.commit(input, plan, p, true, out);
   }
 
   private buildPlan(input: BrainInput, g: Grid, S: number, prefEnd: number, hardEnd: number, cur: Current, p: Planned,
-    section: Section, forced: boolean, exitWhy: string): TransitionPlan {
+    section: Section, forced: boolean, exitWhy: string, endSection: Section = section, dropSwap = false): TransitionPlan {
     const profile = this.env.profile;
     const settings = input.settings;
     const inDeck = input.decks[p.deck];
@@ -744,11 +1086,56 @@ class Brain implements DjBrain {
     if (needsSync(technique) && !(syncOk && g.reliable)) technique = 'echo-out';
 
     const beatLen = g.beatLen;
+    let startCtx = S;
+    if (dropSwap) {
+      // Drop swap : la tension (roll, riser) occupe la fin de la montée du sortant, l'entrant tombe sur le 1 en S.
+      const w: Partial<Record<TransitionTechnique, number>> = { 'riser-drop': 2, 'echo-out': 1 };
+      if (profile.allowGate && (g.reliable || profile.rollWithoutGrid)) w['loop-roll'] = 3;
+      technique = weightedPick(w, this.random) ?? 'echo-out';
+      const room = Math.floor((S - input.nowCtx) / beatLen - 0.5);
+      beats = room >= 8 ? 8 : 4;
+      startCtx = S - beats * beatLen;
+    }
     const total = beats * beatLen;
     let incomingStartCtx: number;
-    if (needsSync(technique) || technique === 'cut') incomingStartCtx = S;
-    else if (technique === 'reverb-wash') incomingStartCtx = S + Math.max(1, Math.floor(beats / 2)) * beatLen;
-    else incomingStartCtx = S + total;
+    if (needsSync(technique) || technique === 'cut') incomingStartCtx = startCtx;
+    else if (technique === 'reverb-wash') incomingStartCtx = startCtx + Math.max(1, Math.floor(beats / 2)) * beatLen;
+    else incomingStartCtx = startCtx + total;
+
+    // Point d'entrée de l'entrant : accorder sa section avec ce que fait le sortant.
+    let incomingStartPos = p.startAt;
+    let entryText = '';
+    const inSt = usableStructure(inAna);
+    const hot = profile.incomingEntry === 'hot';
+    const canSeek = inDeck.caps?.canSeek !== false;
+    const introBlend = technique === 'long-blend' && isElectronic(cur.genre) && isElectronic(p.genre) && !hot && !inSt;
+    if (canSeek && !introBlend && (inSt || hot)) {
+      const kind = entryKindFor(endSection, dropSwap, hot);
+      const e = chooseEntryPoint({
+        structure: inSt, kind, duration: p.track.duration, bpm: inBpm, genre: p.genre, energy: inAna?.energy, hot,
+        longPlay: wantsLongPlay(profile, p.genre, p.track.duration), trackId: p.track.id,
+      });
+      if (e.pos >= 0) {
+        incomingStartPos = e.pos;
+        if (kind === 'drop' && needsSync(technique) && inSt) {
+          // en fondu, le drop de l'entrant tombe sur l'échange des basses : on entre une phrase avant si possible
+          const nb = 60 / inSt.bpm;
+          const swapBeats = technique === 'bass-swap' ? beats : Math.floor(beats / 2);
+          const ph = inSt.phraseBeats * nb;
+          const k = Math.floor((e.pos - swapBeats * nb - inSt.firstDownbeatPos) / ph + 1e-6);
+          const cand = inSt.firstDownbeatPos + k * ph;
+          if (cand >= 0 && cand < e.pos) incomingStartPos = Math.round(cand * 1000) / 1000;
+        }
+        const outWord = isElectronic(cur.genre) || !cur.genre ? 'du drop' : 'du refrain';
+        const outDesc = dropSwap ? 'la montée (drop swap)' : endSection === 'drop' ? `la fin ${outWord}`
+          : endSection === 'breakdown' ? 'le breakdown' : endSection === 'build' ? 'la montée'
+          : endSection === 'outro' ? 'l’outro' : endSection === 'body' ? 'la fin du couplet' : 'la fin de la phrase';
+        entryText = `entrée sur ${e.label} de ${p.deck} (${mmss(e.pos)}) pendant ${outDesc} de ${cur.deck}`;
+      }
+    } else if (technique === 'long-blend' && incomingStartPos > 0 && canSeek && !inSt) {
+      incomingStartPos = 0;
+      entryText = `entrée sur l’intro de ${p.deck} pour un long fondu`;
+    }
     // Re-edit : l'entrant démarre directement au tempo de sortie, quelle que soit la technique.
     const incomingRate = (needsSync(technique) || p.reEdit) && canRate ? clamp(tm.rate, 1 - maxDelta, 1 + maxDelta) : 1;
     // Après la transition : retour à 1 (rateRelaxBeats) sauf si le cerveau garde la main (tempo de soirée, re-edit).
@@ -757,7 +1144,17 @@ class Brain implements DjBrain {
     let intensity = settings.fxAmount <= 0 ? 0
       : clamp(settings.fxAmount * (0.5 + profile.fxDensity) + (genreChange ? 0.15 : 0) + (peak ? 0.1 : 0), 0, profile.maxIntensity);
     intensity = Math.round(intensity * 100) / 100;
-    const accents = this.accents(technique, cur, S, beats, beatLen, outBpm, incomingStartCtx, intensity, genreChange, peak);
+    const accents = this.accents(technique, cur, startCtx, beats, beatLen, outBpm, incomingStartCtx, intensity, genreChange, peak);
+    let funny = false;
+    if (technique === 'loop-roll') {
+      // Vraie boucle (échantillonneur de la table) : un temps du sortant qui raccourcit jusqu'à 1/8.
+      funny = this.random() < profile.funnyDropChance;
+      accents.push({
+        kind: 'loop-roll', target: cur.deck, atCtx: startCtx, beats: funny ? Math.max(1, beats - 1) : beats, bpm: outBpm, loopBeats: 1,
+        amount: Math.max(0.5, intensity),
+        reason: funny ? 'drop marrant : boucle d’un temps qui accélère jusqu’à 1/8, un temps de silence, puis l’entrant' : 'boucle qui raccourcit jusqu’au drop',
+      });
+    }
 
     // Raison lisible
     const head = genreChange ? `Passage ${label(cur.genre)} vers ${label(p.genre)}` : `On reste en ${label(cur.genre)}`;
@@ -775,11 +1172,14 @@ class Brain implements DjBrain {
     const bridge = p.genre && this.s.target && p.genre !== this.s.target && this.s.path.includes(p.genre) ? ` (pont vers ${label(this.s.target)})` : '';
     const noGrid = g.reliable ? '' : ' ; grille de temps peu fiable, transition sans calage';
     const re = p.reEdit ? ` ; ${p.reEdit.text}` : '';
-    const reason = `${head}${bridge} : ${tempo}, ${harmony}, ${tech} ; ${exitWhy}${noGrid}${re}`;
+    const fun = funny ? ' ; drop marrant (boucle d’un temps jusqu’à 1/8, un temps de silence)' : '';
+    const entry = entryText ? ` ; ${entryText}` : '';
+    const reason = `${head}${bridge} : ${tempo}, ${harmony}, ${tech}${fun} ; ${exitWhy}${entry}${noGrid}${re}`;
 
     return {
-      id: this.planId(p), from: cur.deck, to: p.deck, technique, startCtx: S, beats, bpm: outBpm,
-      incomingStartCtx, incomingStartPos: p.startAt, incomingRate: Math.round(incomingRate * 10000) / 10000,
+      id: this.planId(p), from: cur.deck, to: p.deck, technique, startCtx, beats, bpm: outBpm,
+      incomingStartCtx, incomingStartPos, incomingRate: Math.round(incomingRate * 10000) / 10000,
+      preRollBeats: needsSync(technique) && beats >= 32 ? 16 : 8, holdWithLoop: true,
       rateRelaxBeats: Math.abs(incomingRate - 1) > 1e-4 && !keepRate ? profile.rateRelaxBeats : undefined,
       accents, intensity, reason,
     };
@@ -979,11 +1379,13 @@ class Brain implements DjBrain {
     const vocal = cur.analysis?.vocalness ?? 0;
     const allowed: FxKind[] = [];
     if (section === 'build') {
-      allowed.push('low-cut', 'filter-sweep');
+      allowed.push('low-cut', 'filter-sweep', 'loop-roll');
       if (profile.allowGate) allowed.push('gate');
       if (profile.allowRiser && (!profile.riserOnlyOnGenreChangeOrPeak || peak)) allowed.push('riser');
-    } else if ((section === 'drop' || section === 'body') && vocal >= 0.4) allowed.push('echo-throw');
-    else if (section === 'breakdown') allowed.push('reverb-throw');
+    } else if (section === 'drop' || section === 'body') {
+      allowed.push('loop');
+      if (vocal >= 0.4) allowed.push('echo-throw');
+    } else if (section === 'breakdown') allowed.push('reverb-throw');
     if (allowed.length === 0) return;
     const w: Partial<Record<FxKind, number>> = {};
     for (const k of allowed) if (profile.fxWeights[k]) w[k] = profile.fxWeights[k];
@@ -993,7 +1395,10 @@ class Brain implements DjBrain {
     if (!kind) return;
     let beats = 1;
     let reason = '';
+    let loopBeats: number | undefined;
     switch (kind) {
+      case 'loop': loopBeats = this.random() < 0.5 ? 1 : 2; beats = loopBeats * 2; reason = `petit bégaiement : boucle de ${loopBeats} temps sur la fin de la phrase`; break;
+      case 'loop-roll': loopBeats = 1; beats = 4; reason = 'boucle qui raccourcit juste avant le drop'; break;
       case 'low-cut': beats = profile.id === 'paris-tech-house' && this.random() < 0.5 ? 8 : 4; reason = `basses coupées ${beats} temps avant le drop`; break;
       case 'filter-sweep': beats = 8; reason = 'balayage du filtre pendant la montée'; break;
       case 'gate': beats = this.random() < 0.5 ? 2 : 4; reason = 'stutter juste avant le drop'; break;
@@ -1008,7 +1413,7 @@ class Brain implements DjBrain {
     const target: FxCue['target'] = kind === 'gate' || kind === 'riser' ? 'master' : cur.deck;
     const amount = Math.round(clamp(fxAmount * (0.4 + profile.fxDensity), 0.1, 1) * (kind === 'riser' ? 0.7 : 1) * 100) / 100;
     s.lastFxCtx = now;
-    out.push({ type: 'fx', cue: { kind, target, atCtx, beats, bpm: g.bpm, amount, reason } });
+    out.push({ type: 'fx', cue: { kind, target, atCtx, beats, bpm: g.bpm, amount, reason, ...(loopBeats ? { loopBeats } : {}) } });
     this.log(out, `Effet : ${reason}`);
   }
 }

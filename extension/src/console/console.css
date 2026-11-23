@@ -146,6 +146,9 @@ input[type='checkbox'], input[type='radio'] { accent-color: var(--accent); }
 .tr-right { display: flex; flex-direction: column; align-items: flex-end; gap: 2px; }
 .tr-right .count { font-size: 14px; font-weight: 600; white-space: nowrap; }
 .tr-right .fx { font-size: 10px; color: var(--accent); letter-spacing: 0.08em; }
+.tr-right .skip { font-size: 10px; color: var(--bg); background: var(--accent); padding: 0 5px; letter-spacing: 0.08em; border-radius: 2px; }
+.tr-right .skip:empty { display: none; }
+.next-btn { border-color: var(--accent); color: var(--accent); }
 
 /* ---------------------------------------------------------------- scène : platines + table */
 .stage {

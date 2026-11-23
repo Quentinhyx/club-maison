@@ -12,6 +12,9 @@ import react from '@vitejs/plugin-react';
 import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { PNG } from 'pngjs';
+// sources des AudioWorklets : écrites en vrais fichiers (la CSP MV3 refuse les Blob URL)
+import { LIVE_WORKLET_SRC } from './shared/analysis/liveAnalyzer';
+import { LOOP_WORKLET_SRC } from './shared/audio/loop';
 
 const root = resolve(import.meta.dirname, 'extension');
 const outDir = resolve(import.meta.dirname, 'extension-dist');
@@ -57,6 +60,8 @@ function extensionAssets(): Plugin {
     generateBundle() {
       this.emitFile({ type: 'asset', fileName: 'manifest.json', source: readFileSync(resolve(root, 'manifest.json'), 'utf8') });
       for (const s of [16, 48, 128]) this.emitFile({ type: 'asset', fileName: `icons/icon${s}.png`, source: icon(s) });
+      this.emitFile({ type: 'asset', fileName: 'worklets/live-capture.js', source: LIVE_WORKLET_SRC });
+      this.emitFile({ type: 'asset', fileName: 'worklets/loop.js', source: LOOP_WORKLET_SRC });
     },
     async closeBundle() {
       // un build par script de contenu : format IIFE, tout en un seul fichier

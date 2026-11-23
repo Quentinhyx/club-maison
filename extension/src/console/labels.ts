@@ -1,4 +1,4 @@
-import type { Camelot, DeckStatus, FxKind, Section, TransitionTechnique } from '../../../shared/contracts';
+import type { Camelot, DeckStatus, FxKind, Section, StyleProfileId, TransitionTechnique } from '../../../shared/contracts';
 
 export const TECHNIQUE_LABELS: Record<TransitionTechnique, string> = {
   'long-blend': 'Long blend',
@@ -21,7 +21,29 @@ export const FX_LABELS: Record<FxKind, string> = {
   impact: 'Impact',
   gate: 'Gate',
   brake: 'Frein',
+  loop: 'Boucle',
+  'loop-roll': 'Loop roll',
 };
+
+export const STYLE_LABELS: Partial<Record<StyleProfileId, string>> = {
+  soiree: 'Soirée',
+  'paris-tech-house': 'Paris tech house',
+  'open-format': 'Open format',
+  lounge: 'Lounge',
+  'peak-time': 'Peak time',
+};
+
+/** Ordre d'affichage des styles : « Soirée » en premier. */
+export function styleOrder(ids: StyleProfileId[]): StyleProfileId[] {
+  return [...ids].sort((a, b) => (a === 'soiree' ? -1 : b === 'soiree' ? 1 : 0));
+}
+
+/** Longueur de boucle lisible : 4, 2, 1, 1/2, 1/4… */
+export function fmtLoop(beats: number): string {
+  if (beats >= 1) return String(Math.round(beats * 100) / 100);
+  const d = Math.round(1 / beats);
+  return `1/${d}`;
+}
 
 export const SECTION_LABELS: Record<Section, string> = {
   intro: 'INTRO',

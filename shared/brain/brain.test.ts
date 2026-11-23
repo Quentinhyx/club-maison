@@ -5,7 +5,7 @@
  */
 import assert from 'node:assert/strict';
 import type {
-  BrainDecision, BrainInput, Camelot, CrowdState, DeckCapabilities, DeckId, DeckState, DjSettings, FxCue, Genre, GroovePlan,
+  BrainDecision, BrainInput, Camelot, CrowdState, DeckCapabilities, DeckId, DeckState, DjSettings, FxCue, Genre, GroovePlan, TrackStructure,
   LiveAnalysis, PlayedTrack, QueueItem, Section, StyleProfileId, TrackAnalysis, TrackRef, TransitionPlan, TransitionTechnique,
 } from '../contracts';
 import { GENRES, GENRE_LABELS, RATE_LIMITS } from '../contracts';
@@ -70,6 +70,28 @@ function makeCatalogue(seed = 7, perGenre = 40): Map<number, SimTrack> {
   return cat;
 }
 const CATALOGUE = makeCatalogue();
+
+const SECTION_ENERGY: Record<Section, number> = { intro: 0.4, body: 0.6, build: 0.7, drop: 0.9, breakdown: 0.3, outro: 0.4, unknown: 0.5 };
+
+/** Structure synthétique du morceau complet, cohérente avec la LiveAnalysis du simulateur. */
+function structureOf(t: SimTrack): TrackStructure {
+  const nb = 60 / t.analysis.bpm;
+  const ph = 32 * nb;
+  const P = Math.floor(t.track.duration / ph);
+  const sections: TrackStructure['sections'] = [];
+  const runs: number[] = [];
+  for (let p = 0; p < P; p++) {
+    const sec = simSection(p, P);
+    sections.push({ section: sec, startPos: p * ph, endPos: (p + 1) * ph, energy: SECTION_ENERGY[sec] });
+    if (sec === 'drop' && (p === 0 || simSection(p - 1, P) !== 'drop')) runs.push(p * ph);
+  }
+  // le 2e drop est le plus marquant, puis le 1er, puis les autres
+  const dropPositions = runs.length >= 2 ? [runs[1], runs[0], ...runs.slice(2)] : runs;
+  return { bpm: t.analysis.bpm, firstDownbeatPos: 0, phraseBeats: 32, sections, dropPositions, outroPos: (P - 1) * ph, confidence: 0.8 };
+}
+function simSection(p: number, P: number): Section {
+  return p === 0 ? 'intro' : p >= P - 1 ? 'outro' : SECTION_PATTERN[(p - 1) % SECTION_PATTERN.length];
+}
 const byGenre = (g: Genre) => [...CATALOGUE.values()].filter((t) => t.genre === g);
 
 // --------------------------------------------------------------------------------------------- simulateur
@@ -99,6 +121,9 @@ interface TransitionRecord {
   endsBeforeOut?: boolean;
   outReliable: boolean;
   endCtx: number;
+  phaseDistIn?: number;
+  outSectionEnd?: Section;
+  shortened?: boolean;
 }
 
 interface SimOptions {
@@ -113,6 +138,11 @@ interface SimOptions {
   random?: () => number;
   targetBpm?: number;
   allowReEdits?: boolean;
+  /** Structures des morceaux fournies ; delay : disponibles seulement N s après le chargement. */
+  structure?: boolean;
+  structureDelay?: number;
+  /** Une partie des candidats vient de la radio de l'artiste en cours ('similar'). */
+  similar?: boolean;
   minPlay?: number;
   maxPlay?: number;
 }
@@ -152,6 +182,12 @@ class Sim {
   beatConfidence: number;
   loadLatency: number;
   keepDecisions = false;
+  withStructure: boolean;
+  structureDelay: number;
+  structureAt = new Map<number, number>();
+  withSimilar: boolean;
+  skipAt?: number;
+  loopOffGrid = 0;
 
   constructor(o: SimOptions = {}) {
     this.brain = createBrain({ random: o.random ?? mulberry32(o.seed ?? 42) });
@@ -159,6 +195,9 @@ class Sim {
     const mk = (id: DeckId): SimDeck => ({ id, status: 'empty', position: 0, rate: 1, caps: { ...caps }, startedCtx: 0, readyAt: 0 });
     this.decks = { A: mk('A'), B: mk('B') };
     this.beatConfidence = o.beatConfidence ?? 0.9;
+    this.withStructure = !!o.structure;
+    this.structureDelay = o.structureDelay ?? 0;
+    this.withSimilar = !!o.similar;
     this.loadLatency = o.loadLatency ?? 1.5;
     this.settings = {
       ...DEFAULT_SETTINGS, style: o.style ?? 'paris-tech-house', fxAmount: o.fxAmount ?? 0.5,
@@ -194,9 +233,19 @@ class Sim {
     };
   }
 
+  /** Analyse telle que l'orchestrateur la connaît (avec la structure si elle est disponible). */
+  analysisOf(id: number): TrackAnalysis | undefined {
+    const t = CATALOGUE.get(id);
+    if (!t) return undefined;
+    if (!this.withStructure) return t.analysis;
+    const at = this.structureDelay > 0 ? this.structureAt.get(id) : 0;
+    if (at === undefined || this.nowCtx < at) return t.analysis;
+    return { ...t.analysis, structure: structureOf(t) };
+  }
+
   private deckState(d: SimDeck): DeckState {
     return {
-      id: d.id, status: d.status, track: d.track, analysis: d.analysis, live: this.live(d), position: d.position,
+      id: d.id, status: d.status, track: d.track, analysis: d.track ? this.analysisOf(d.track.id) : undefined, live: this.live(d), position: d.position,
       duration: d.track?.duration ?? 0, rate: d.rate, caps: d.caps,
     };
   }
@@ -206,7 +255,7 @@ class Sim {
     for (const g of this.requested) {
       for (const t of byGenre(g)) {
         const hasAna = this.analyzed.has(t.track.id) || t.track.id % 5 !== 0; // 20 % sans analyse au départ
-        out.push({ track: t.track, analysis: hasAna ? t.analysis : undefined, genre: g });
+        out.push({ track: t.track, analysis: hasAna ? this.analysisOf(t.track.id) : undefined, genre: g, source: this.withSimilar && t.track.id % 4 === 0 ? 'similar' : 'catalog' });
       }
     }
     return out;
@@ -217,10 +266,10 @@ class Sim {
       nowCtx: this.nowCtx, nowMs: this.nowMs,
       decks: { A: this.deckState(this.decks.A), B: this.deckState(this.decks.B) },
       queue: this.queue.map((q) => ({ ...q })), candidates: this.candidates(), crowd: this.crowd, settings: this.settings,
-      history: this.history.slice(), activeTransition: this.active,
+      history: this.history.slice(), activeTransition: this.active, skipRequestedAt: this.skipAt,
       // résultats d'analyse des sons de la file (champ optionnel BrainInputExtras)
-      analyses: this.queue.filter((q) => this.analyzed.has(q.track.id) && CATALOGUE.has(q.track.id)).map((q) => CATALOGUE.get(q.track.id)!.analysis),
-    } as BrainInput;
+      analyses: Object.fromEntries(this.queue.filter((q) => this.analyzed.has(q.track.id) && CATALOGUE.has(q.track.id)).map((q) => [q.track.id, this.analysisOf(q.track.id)!])),
+    };
   }
 
   genreOf(t?: TrackRef): Genre | undefined { return t ? CATALOGUE.get(t.id)?.genre ?? t.genres?.[0] : undefined; }
@@ -248,14 +297,25 @@ class Sim {
           deck.rate = 1;
           deck.relax = undefined;
           deck.readyAt = this.nowCtx + this.loadLatency;
+          if (this.structureDelay > 0 && !this.structureAt.has(d.track.id)) this.structureAt.set(d.track.id, this.nowCtx + this.structureDelay);
           break;
         }
         case 'transition': {
           const plan = d.plan;
+          if (this.active && plan.id === this.active.id) {
+            // mise à jour (transition raccourcie après un « suivant »)
+            this.active = plan;
+            this.activeEnd = plan.startCtx + (plan.beats * 60) / plan.bpm;
+            const r = this.transitions[this.transitions.length - 1];
+            r.plan = plan;
+            r.endCtx = this.activeEnd;
+            r.shortened = true;
+            break;
+          }
           if (this.active) this.violations.push(`transition ${plan.id} pendant ${this.active.id}`);
           if (plan.startCtx < this.nowCtx - 1e-6) this.violations.push(`transition ${plan.id} dans le passé`);
           const inDeck = this.decks[plan.to];
-          if (inDeck.status !== 'ready') this.violations.push(`transition vers une platine pas prête (${inDeck.status})`);
+          if (inDeck.status !== 'ready' && !(plan.holdWithLoop && inDeck.status === 'loading')) this.violations.push(`transition vers une platine pas prête (${inDeck.status})`);
           const out = this.decks[plan.from];
           const rec: TransitionRecord = {
             plan, atNow: this.nowCtx, inTrack: inDeck.track!, inGenre: this.genreOf(inDeck.track),
@@ -266,6 +326,9 @@ class Sim {
             const posAt = out.position + (plan.startCtx - this.nowCtx) * out.rate;
             const phase = ((posAt / nb) % 32 + 32) % 32;
             rec.phaseDist = Math.min(phase, 32 - phase);
+            const phIn = ((((out.position + (plan.incomingStartCtx - this.nowCtx) * out.rate) / nb) % 32) + 32) % 32;
+            rec.phaseDistIn = Math.min(phIn, 32 - phIn);
+            rec.outSectionEnd = simSection(Math.floor((posAt / nb - 0.5) / 32), Math.floor(out.track.duration / (32 * nb)));
             rec.played = plan.startCtx - out.startedCtx;
             const outEnd = this.nowCtx + (out.track.duration - out.position) / out.rate;
             rec.endsBeforeOut = rec.endCtx <= outEnd + 1e-6;
@@ -280,6 +343,13 @@ class Sim {
         }
         case 'fx': {
           this.fx.push({ cue: d.cue, now: this.nowCtx });
+          if (d.cue.kind === 'loop' || d.cue.kind === 'loop-roll') {
+            const td = d.cue.target === 'master' ? this.playingDeck() : this.decks[d.cue.target];
+            if (td?.analysis) {
+              const b = (td.position + (d.cue.atCtx - this.nowCtx) * td.rate) / (60 / td.analysis.bpm);
+              if (Math.abs(b - Math.round(b)) > 0.05) this.loopOffGrid++;
+            }
+          }
           if (this.active) this.violations.push(`effet ${d.cue.kind} pendant la transition ${this.active.id}`);
           const deck = d.cue.target === 'master' ? Object.values(this.decks).find((x) => x.status === 'playing') : this.decks[d.cue.target];
           if (deck && d.cue.atCtx < deck.startedCtx + 8 * (60 / d.cue.bpm) - 1e-6) this.violations.push(`effet ${d.cue.kind} dans les 8 premiers temps`);
@@ -358,7 +428,7 @@ class Sim {
       if (d.position >= d.track.duration) d.status = 'ended';
     }
     const a = this.active;
-    if (a && !this.incomingStarted && this.nowCtx >= a.incomingStartCtx) {
+    if (a && !this.incomingStarted && this.nowCtx >= a.incomingStartCtx && this.decks[a.to].status === 'ready') {
       const d = this.decks[a.to];
       d.status = 'playing';
       d.rate = a.incomingRate;
@@ -405,11 +475,14 @@ function checkInvariants(sim: Sim, label: string): void {
   const ids = sim.played().map((t) => t.id);
   assert.equal(new Set(ids).size, ids.length, `${label} : un morceau a été rejoué`);
   assert.ok(sim.silence < 0.5, `${label} : silence de ${sim.silence.toFixed(1)} s`);
+  assert.equal(sim.loopOffGrid, 0, `${label} : boucle hors de la grille`);
   for (const t of sim.mixes()) {
     const where = `${label} : ${t.plan.id} (${t.plan.technique})`;
     assert.ok(t.endsBeforeOut, `${where} finit après la fin du morceau sortant`);
-    assert.ok((t.played ?? 0) >= sim.settings.minPlaySeconds - 0.01, `${where} avant minPlaySeconds (${t.played?.toFixed(1)} s)`);
-    if (t.outReliable) assert.ok((t.phaseDist ?? 99) < 0.3, `${where} pas sur un début de phrase (écart ${t.phaseDist?.toFixed(2)} temps)`);
+    const skip = /Suivant demandé/.test(t.plan.reason);
+    if (!skip) assert.ok((t.played ?? 0) >= sim.settings.minPlaySeconds - 0.01, `${where} avant minPlaySeconds (${t.played?.toFixed(1)} s)`);
+    if (t.outReliable && !skip) assert.ok(Math.min(t.phaseDist ?? 99, t.phaseDistIn ?? 99) < 0.3, `${where} pas sur un début de phrase (écart ${t.phaseDist?.toFixed(2)} temps)`);
+    assert.ok(t.plan.preRollBeats !== undefined && t.plan.holdWithLoop === true, `${where} : preRollBeats / holdWithLoop absents`);
     assert.ok(t.plan.reason.length > 20, `${where} : raison vide`);
     assert.ok(t.plan.intensity >= 0 && t.plan.intensity <= 1, `${where} : intensité hors bornes`);
   }

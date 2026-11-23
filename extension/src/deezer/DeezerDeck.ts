@@ -98,6 +98,12 @@ export class DeezerDeck implements DeckController {
     await this.bridge.command(this.id, { op: 'rate', rate }, 3000);
   }
 
+  /** Latence mesurée par le chef d'orchestre (position qui avance / son capté). */
+  recordLatency(seconds: number): void {
+    const m = seconds + this.settings.captureLatency;
+    if (m > 0 && m < 5) this.latency = this.latency * 0.5 + m * 0.5;
+  }
+
   /** Latence de démarrage mesurée (s) : de play() au son capté dans la console. */
   startLatency(): number {
     return this.latency;

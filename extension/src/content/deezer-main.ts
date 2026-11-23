@@ -300,7 +300,7 @@ declare global {
   }
 
   function onTimeUpdate(m: HTMLMediaElement) {
-    if (expected && !loading && !m.paused && m.duration > 0 && m.currentTime >= m.duration - 0.25) {
+    if (expected && !loading && !m.paused && m.duration > 0 && m.currentTime >= m.duration - 0.25 * Math.max(1, m.playbackRate)) {
       // fin du titre : on coupe avant que Deezer n'enchaîne
       pauseNow();
       ended = true;
@@ -428,6 +428,7 @@ declare global {
   }
 
   async function seekTo(pos: number): Promise<void> {
+    ended = false; // retour dans le morceau (fin de pré-écoute, recalage) : il n'est plus fini
     const m = el();
     const dz = player();
     const near = () => !!el() && Math.abs(el()!.currentTime - pos) < 0.35;

@@ -9,7 +9,7 @@ import {
   hostSetNowPlaying, hostSetRequestStatus, hostUpdateSettings, maskGuestId, MINUTE, normalizeParty,
   sanitizeTrack, voteEnergy, voteGenre,
 } from './party.js';
-import { catalogForGenre, getTrack, searchTracks, toTrackRef } from '../../shared/deezer/index.js';
+import { catalogForGenre, getTrack, searchTracks, similarTracks, toTrackRef } from '../../shared/deezer/index.js';
 import type { TrackRef } from '../../shared/contracts.js';
 
 let failures = 0;
@@ -347,6 +347,31 @@ await test('catalogForGenre : playlists + artistes, dédoublonné, durées filtr
   assert.ok(r.every((t) => t.genres?.[0] === 'tech-house'));
   assert.ok(!calls.some((u) => u.includes('/playlist/78/')));
   assert.ok(calls.some((u) => u.includes('artist%3A')));
+});
+
+
+await test('similarTracks : radio + artistes proches, sans le morceau lui-même, genre conservé', async () => {
+  const { f, calls } = mockFetch((url) => {
+    if (url.includes('/artist/10/radio')) return { data: [RAW(1, { artist: { id: 10, name: 'A' } }), RAW(2), RAW(3, { duration: 30 })] };
+    if (url.includes('/artist/10/related')) return { data: [{ id: 20 }, { id: 21 }] };
+    if (url.includes('/artist/20/top')) return { data: [RAW(4), RAW(2)] };
+    if (url.includes('/artist/21/top')) return { data: [RAW(5)] };
+    return { data: [] };
+  });
+  const seed: TrackRef = { id: 1, title: 'T1', artist: 'A', artistId: 10, duration: 200, genres: ['house'] };
+  const r = await similarTracks(seed, { fetcher: f });
+  assert.deepEqual(r.map((t) => t.id).sort((a, b) => a - b), [2, 4, 5]);
+  assert.ok(r.every((t) => t.genres?.[0] === 'house'));
+  assert.ok(!calls.some((u) => u.includes('/search/artist')));
+  assert.equal(toTrackRef(RAW(9, { artist: { id: 42, name: 'X' } })).artistId, 42);
+});
+
+await test('« Suivant » depuis le téléphone : skipAt posé à l’heure du serveur', async () => {
+  const s = new MemoryStore();
+  const before = Date.now();
+  const r = await hostUpdateSettings(s, P, { skipAt: 1 });
+  assert.ok(r.ok);
+  if (r.ok) assert.ok((r.value.skipAt ?? 0) >= before);
 });
 
 console.log(`\n${passed} réussi(s), ${failures} échec(s)`);

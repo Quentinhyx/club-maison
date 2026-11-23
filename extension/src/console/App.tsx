@@ -21,6 +21,20 @@ export function App({ initial }: { initial: ConsoleSettings }) {
   const [snap, setSnap] = useState<ConductorSnapshot>(() => engine.conductor.getSnapshot());
   const [starting, setStarting] = useState(false);
 
+  // raccourcis : flèche droite ou N = morceau suivant
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      const tag = (e.target as HTMLElement | null)?.tagName;
+      if (tag === 'INPUT' || tag === 'SELECT' || tag === 'TEXTAREA' || e.metaKey || e.ctrlKey || e.altKey) return;
+      if ((e.key === 'ArrowRight' || e.key === 'n' || e.key === 'N') && engine.conductor.isRunning()) {
+        e.preventDefault();
+        engine.conductor.requestSkip('clavier');
+      }
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [engine]);
+
   useEffect(() => {
     const t = setInterval(() => setSnap(engine.conductor.getSnapshot()), 250);
     (window as any).__club = engine; // accès console de debug
@@ -91,6 +105,9 @@ export function App({ initial }: { initial: ConsoleSettings }) {
           ) : (
             <button onClick={() => engine.conductor.stop()}>Pause</button>
           )}
+          <button className="next-btn" disabled={!running} onClick={() => engine.conductor.requestSkip('bouton Suivant')} title="Suivant (flèche droite ou N)">
+            Suivant
+          </button>
           <button className={manual ? 'accent-outline' : ''} onClick={() => engine.conductor.setAutopilot(manual)}>
             {manual ? 'Rendre la main au pilote' : 'Je reprends la main'}
           </button>

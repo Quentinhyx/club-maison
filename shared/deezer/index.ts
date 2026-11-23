@@ -64,6 +64,8 @@ export function toTrackRef(raw: any): TrackRef {
     artist: String(raw?.artist?.name || ''),
     duration: Number(raw?.duration) || 0,
   };
+  const artistId = Number(raw?.artist?.id);
+  if (artistId > 0) t.artistId = artistId;
   // title_short perd les "(Extended Mix)" utiles au DJ : on garde le titre complet s'il existe.
   if (typeof raw?.title === 'string' && raw.title) t.title = raw.title;
   if (raw?.album?.title) t.album = String(raw.album.title);
@@ -322,6 +324,61 @@ export async function catalogForGenre(
 
   // Mélange léger : on garde une préférence pour les morceaux populaires.
   const scored = out.map((t) => ({ t, s: Math.log10((t.rank ?? 1000) + 10) + Math.random() * 2.5 }));
+  scored.sort((a, b) => b.s - a.s);
+  return scored.slice(0, limit).map((x) => x.t);
+}
+
+// ---------------------------------------------------------------------------------------------
+// Morceaux similaires (file vide : rester dans le même registre)
+// ---------------------------------------------------------------------------------------------
+
+/**
+ * Morceaux proches de `track` : radio de l'artiste (mix Deezer d'artistes voisins) + meilleurs titres de
+ * quelques artistes proches. Sans artistId, on le retrouve par une recherche sur le nom.
+ * Le morceau lui-même est exclu ; durées absurdes filtrées ; dédoublonné ; mélange léger.
+ */
+export async function similarTracks(
+  track: TrackRef,
+  opts: { limit?: number; fetcher?: Fetcher } = {},
+): Promise<TrackRef[]> {
+  const f = opts.fetcher;
+  const limit = Math.max(1, Math.min(60, opts.limit ?? 30));
+  let artistId = track.artistId;
+  if (!artistId && track.artist) {
+    try {
+      const json = await deezerGet(`/search/artist?q=${encodeURIComponent(track.artist)}&limit=1`, f);
+      artistId = Number(json?.data?.[0]?.id) || undefined;
+    } catch {
+      /* rien : pas de similaires */
+    }
+  }
+  if (!artistId) return [];
+
+  const list = (json: any): TrackRef[] => (Array.isArray(json?.data) ? json.data : []).filter(usable).map(toTrackRef);
+  const tasks: Array<() => Promise<TrackRef[]>> = [
+    () => deezerGet(`/artist/${artistId}/radio?limit=40`, f).then(list),
+    async () => {
+      const rel = await deezerGet(`/artist/${artistId}/related?limit=6`, f);
+      const ids: number[] = (Array.isArray(rel?.data) ? rel.data : []).map((a: any) => Number(a?.id)).filter((x: number) => x > 0).slice(0, 4);
+      const tops = await Promise.all(ids.map((id) => deezerGet(`/artist/${id}/top?limit=5`, f).then(list).catch(() => [] as TrackRef[])));
+      return tops.flat();
+    },
+  ];
+  const results = (await Promise.all(tasks.map((t) => t().catch(() => [] as TrackRef[])))).flat();
+
+  const seen = new Set<number>([track.id]);
+  const seenTitle = new Set<string>([`${track.artist}|${track.title}`.toLowerCase()]);
+  const out: TrackRef[] = [];
+  for (const t of results) {
+    if (!t.id || seen.has(t.id)) continue;
+    if (t.duration < MIN_DURATION || t.duration > MAX_DURATION) continue;
+    const key = `${t.artist}|${t.title}`.toLowerCase();
+    if (seenTitle.has(key)) continue;
+    seen.add(t.id);
+    seenTitle.add(key);
+    out.push(track.genres ? { ...t, genres: track.genres } : t);
+  }
+  const scored = out.map((t) => ({ t, s: Math.log10((t.rank ?? 1000) + 10) + Math.random() * 2 }));
   scored.sort((a, b) => b.s - a.s);
   return scored.slice(0, limit).map((x) => x.t);
 }

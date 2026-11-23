@@ -6,9 +6,10 @@
 import type { DeckController, DeckId, DjSettings, Genre, TrackAnalysis, TrackRef } from '../../shared/contracts';
 import { Mixer, PreviewDeck, phaseNudge, rateRamp } from '../../shared/audio/index';
 import { LiveAnalyzer, analyzePreview, analyzeBuffer, getCachedAnalysis } from '../../shared/analysis/index';
-import { createBrain, DEFAULT_SETTINGS } from '../../shared/brain/index';
+import { createBrain, DEFAULT_SETTINGS, GENRE_GRAPH } from '../../shared/brain/index';
+import { TrackScanner, structureFromWaveform } from '../../shared/analysis/structure';
 import { SynthDeck, listDemoTracks, getDemoBuffer, isDemoTrack, computeWaveformAsync } from '../../shared/demo/index';
-import { catalogForGenre, searchTracks } from '../../shared/deezer/index';
+import { catalogForGenre, searchTracks, similarTracks } from '../../shared/deezer/index';
 import { Conductor, DECK_IDS, type AnalyzerLike } from './conductor';
 import { envFetch, envTrack, isExtension } from './lib/env';
 import { GuestApi } from './lib/guestApi';
@@ -80,7 +81,10 @@ export class Engine {
     const s = opts.settings;
     this.mode = !isExtension && s.deckMode === 'deezer' ? 'synth' : s.deckMode;
     this.ctx = new AudioContext({ latencyHint: 'interactive' });
-    this.mixer = new Mixer(this.ctx);
+    // extension MV3 : les worklets (analyse, échantillonneur de boucles) sont de vrais fichiers du build,
+    // car la CSP refuse les Blob URL ; en localhost, les modules gardent leurs Blob URL.
+    const mixerWorklet = isExtension ? chrome.runtime.getURL('worklets/loop.js') : undefined;
+    this.mixer = new Mixer(this.ctx, { workletUrl: mixerWorklet });
     this.mixer.output.connect(this.ctx.destination);
     if (s.outputDeviceId && 'setSinkId' in this.ctx) {
       void (this.ctx as any).setSinkId(s.outputDeviceId).catch(() => {});
@@ -89,9 +93,10 @@ export class Engine {
       A: this.makeDeck('A'),
       B: this.makeDeck('B'),
     };
+    const liveWorklet = isExtension ? chrome.runtime.getURL('worklets/live-capture.js') : undefined;
     this.analyzers = {
-      A: new LiveAnalyzer(this.ctx, this.mixer.getDeckTap('A')),
-      B: new LiveAnalyzer(this.ctx, this.mixer.getDeckTap('B')),
+      A: new LiveAnalyzer(this.ctx, this.mixer.getDeckTap('A'), { workletUrl: liveWorklet }),
+      B: new LiveAnalyzer(this.ctx, this.mixer.getDeckTap('B'), { workletUrl: liveWorklet }),
     };
     this.meters = new Meters(this.ctx, this.mixer);
     this.waves = new WaveformStore(this.ctx, this.mixer, computeWaveformAsync);
@@ -118,6 +123,20 @@ export class Engine {
         const d = this.decks[id];
         return d instanceof DeezerDeck ? d.startLatency() : 0.02;
       },
+      similar: (t) => (demo ? Promise.resolve(demoSimilar(t)) : similarTracks(t, { limit: 30, fetcher: envFetch })),
+      scan:
+        this.mode === 'deezer'
+          ? {
+              supported: (id) => this.decks[id] instanceof DeezerDeck,
+              sampleRate: this.ctx.sampleRate,
+              create: (o) => new TrackScanner({ ...o, pointsPerSecond: 40 }),
+              capture: (id, onFrame) => this.capturePcm(id, onFrame),
+            }
+          : undefined,
+      reportLatency: (id, s2) => {
+        const d = this.decks[id];
+        if (d instanceof DeezerDeck) d.recordLatency(s2);
+      },
       outputLatency: (id) => (this.decks[id] instanceof DeezerDeck ? s.captureLatency : 0),
       timers: { setTimeout: (f, ms) => setTimeout(f, ms), clearTimeout: (h) => clearTimeout(h as number) },
       guestApi: s.apiUrl ? new GuestApi(s.apiUrl, s.hostKey, s.party) : null,
@@ -127,11 +146,40 @@ export class Engine {
         if (evt.type === 'log') this.conductor.log('warn', `${deck ? `Platine ${deck} : ` : ''}${evt.msg}`);
       });
     }
+    this.waves.external = (id) => this.conductor.getWaveform(id);
     for (const id of DECK_IDS) {
       this.decks[id].on((e) => {
         if (e.type === 'track' && e.track) void this.waves.prepare(id, e.track);
       });
     }
+  }
+
+  /** Capture PCM mono de la sortie (avant fader) d'une platine, pour la pré-écoute accélérée. */
+  private capturePcm(id: DeckId, onFrame: (frame: Float32Array, endCtx: number) => void): () => void {
+    const tap = this.mixer.getDeckTap(id);
+    const sp = this.ctx.createScriptProcessor(4096, 2, 1);
+    const mute = this.ctx.createGain();
+    mute.gain.value = 0;
+    sp.onaudioprocess = (e) => {
+      const L = e.inputBuffer.getChannelData(0);
+      const R = e.inputBuffer.numberOfChannels > 1 ? e.inputBuffer.getChannelData(1) : L;
+      const m = new Float32Array(L.length);
+      for (let i = 0; i < L.length; i++) m[i] = 0.5 * (L[i] + R[i]);
+      onFrame(m, this.ctx.currentTime);
+    };
+    tap.connect(sp);
+    sp.connect(mute);
+    mute.connect(this.ctx.destination);
+    return () => {
+      sp.onaudioprocess = null;
+      try {
+        tap.disconnect(sp);
+      } catch {
+        /* déjà débranché */
+      }
+      sp.disconnect();
+      mute.disconnect();
+    };
   }
 
   private makeDeck(id: DeckId): DeckController {
@@ -176,7 +224,16 @@ export class Engine {
       const sr = buf.sampleRate;
       const from = Math.min(Math.max(0, buf.length - 30 * sr), Math.floor(buf.length / 3));
       const ch = Array.from({ length: buf.numberOfChannels }, (_, i) => buf.getChannelData(i).subarray(from, from + 30 * sr));
-      return analyzeBuffer(ch, buf.sampleRate, t);
+      const a = analyzeBuffer(ch, buf.sampleRate, t);
+      // même information qu'après une pré-écoute Deezer : structure du morceau complet (drops, outro…)
+      try {
+        const wf = await computeWaveformAsync(buf, 50);
+        const structure = structureFromWaveform({ trackId: t.id, low: wf.low, mid: wf.mid, high: wf.high, peak: wf.peak, pointsPerSecond: 50, coverage: 1 }, a.bpm);
+        if (structure) return { ...a, structure };
+      } catch {
+        /* structure facultative */
+      }
+      return a;
     }
     return analyzePreview(this.ctx, envTrack(t), envFetch);
   }
@@ -191,6 +248,7 @@ export class Engine {
 
   async start(): Promise<void> {
     await this.ctx.resume();
+    await this.mixer.ready.catch(() => {});
     await this.connectDecks();
     this.conductor.start();
   }
@@ -208,6 +266,17 @@ export class Engine {
 
 function norm(s: string): string {
   return s.toLowerCase().normalize('NFD').replace(/[̀-ͯ]/g, '').trim();
+}
+
+/** Similaires en démo hors ligne : même genre ou genres voisins, tempo à ±6 %. */
+export function demoSimilar(t: TrackRef): TrackRef[] {
+  const g = t.genres ?? [];
+  const near = new Set<Genre>(g);
+  for (const x of g) for (const n of Object.keys(GENRE_GRAPH[x] ?? {})) near.add(n as Genre);
+  const bpm = t.bpm ?? 0;
+  return listDemoTracks().filter(
+    (o) => o.id !== t.id && (o.genres ?? []).some((x) => near.has(x)) && (!bpm || !o.bpm || Math.abs(o.bpm / bpm - 1) <= 0.06),
+  );
 }
 
 /** Catalogue de la démo hors ligne : morceaux synthétiques du genre, sinon les plus proches en BPM. */

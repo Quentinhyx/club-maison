@@ -8,6 +8,7 @@ import type { DeckId, ParamTarget } from '../../../shared/contracts';
 import type { Engine } from '../engine';
 import type { MixerLike } from '../conductor';
 import { getFrame, phaseDiff, useFrame } from './frame';
+import { fmtLoop } from './labels';
 
 const EQ_MIN = -26;
 const EQ_MAX = 6;
@@ -144,6 +145,16 @@ export function MixerPanel({ engine, manual }: { engine: Engine; manual: boolean
       const s = on ? `${Math.round(Math.min(1, v) * 100)}` : '—';
       if (val && val.textContent !== s) val.textContent = s;
     }
+    // boucle : LED avec la longueur (A 1/2, B 4…)
+    const loops = engine.conductor.getLoops();
+    const lel = leds.current.LOOP;
+    if (lel) {
+      const parts = (['A', 'B'] as DeckId[]).filter((d) => loops[d]).map((d) => `${d} ${fmtLoop(loops[d]!.beats)}`);
+      lel.dataset.on = parts.length ? '1' : '0';
+      const val = lel.querySelector('.v');
+      const s = parts.length ? parts.join(' ') : '—';
+      if (val && val.textContent !== s) val.textContent = s;
+    }
 
     // phase
     const d = phaseDiff(f.views.A, f.views.B);
@@ -263,7 +274,7 @@ export function MixerPanel({ engine, manual }: { engine: Engine; manual: boolean
           <div className="ch-name">MASTER</div>
           <canvas className="vu vu-master" ref={(el) => { vu.current.M = el; }} />
           <div className="leds">
-            {['ECHO', 'REVERB', 'RISER', 'GATE', 'FILTER'].map((k) => (
+            {['ECHO', 'REVERB', 'RISER', 'GATE', 'FILTER', 'LOOP'].map((k) => (
               <div className="led" key={k} ref={(el) => { leds.current[k] = el; }} data-on="0">
                 <i />
                 <span className="k">{k}</span>

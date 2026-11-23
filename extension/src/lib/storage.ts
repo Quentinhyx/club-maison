@@ -21,6 +21,10 @@ export interface ConsoleSettings {
   /** Latence de capture ajoutée (s), utilisée pour caler la phase des platines Deezer. */
   captureLatency: number;
   dj?: Partial<DjSettings>;
+  /** L'hôte a choisi le style lui-même (sinon on peut le faire évoluer d'une version à l'autre). */
+  styleTouched?: boolean;
+  /** Migrations déjà faites (une seule fois chacune). */
+  migrations?: string[];
 }
 
 export const DEFAULT_CONSOLE_SETTINGS: ConsoleSettings = {
@@ -36,6 +40,19 @@ export const DEFAULT_CONSOLE_SETTINGS: ConsoleSettings = {
 };
 
 const KEY = 'clubMaison.settings';
+
+/** Migrations des réglages sauvegardés (une fois chacune). */
+export function migrateSettings(s: ConsoleSettings): ConsoleSettings {
+  const done = new Set(s.migrations ?? []);
+  let out = s;
+  if (!done.has('style-soiree')) {
+    // nouveau profil par défaut « Soirée » : on y passe sauf si l'hôte avait choisi son style à la main
+    if (out.dj?.style === 'paris-tech-house' && !out.styleTouched) out = { ...out, dj: { ...out.dj, style: 'soiree' } };
+    done.add('style-soiree');
+    out = { ...out, migrations: [...done] };
+  }
+  return out;
+}
 
 /** Console servie en ligne (https, hors localhost) : l'API des invités est sur le même site. */
 const hostedOrigin: string = (() => {
@@ -56,10 +73,16 @@ export async function loadSettings(): Promise<ConsoleSettings> {
   try {
     if (isExtension) {
       const r = await chrome.storage.local.get(KEY);
-      return withDefaults({ ...DEFAULT_CONSOLE_SETTINGS, ...((r?.[KEY] as Partial<ConsoleSettings>) ?? {}) });
+      const stored = r?.[KEY] as Partial<ConsoleSettings> | undefined;
+      const m = migrateSettings({ ...DEFAULT_CONSOLE_SETTINGS, ...(stored ?? {}) });
+      if (stored && (stored.migrations?.length ?? 0) !== (m.migrations?.length ?? 0)) await saveSettings(m);
+      return withDefaults(m);
     }
     const raw = localStorage.getItem(KEY);
-    return withDefaults({ ...DEFAULT_CONSOLE_SETTINGS, ...(raw ? JSON.parse(raw) : {}) });
+    const stored = raw ? (JSON.parse(raw) as Partial<ConsoleSettings>) : undefined;
+    const m = migrateSettings({ ...DEFAULT_CONSOLE_SETTINGS, ...(stored ?? {}) });
+    if (stored && (stored.migrations?.length ?? 0) !== (m.migrations?.length ?? 0)) await saveSettings(m);
+    return withDefaults(m);
   } catch {
     return withDefaults({ ...DEFAULT_CONSOLE_SETTINGS });
   }

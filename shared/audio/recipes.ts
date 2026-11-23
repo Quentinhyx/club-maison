@@ -13,6 +13,7 @@ import {
   DECK_PARAMS, DECK_PARAM_SPECS, ECHO_FEEDBACK_NEUTRAL, EQ_KILL_DB, MASTER_PARAM_SPECS,
   REVERB_RETURN_NEUTRAL, clamp, clampParam, isDeckTarget, sortPoints, valueAtPoints,
 } from './params';
+import { loopRollCut, transitionRollBeats } from './loop';
 
 // ---------------------------------------------------------------------------------------------
 // Construction des lanes
@@ -305,15 +306,20 @@ const reverbWash: Recipe = ({ b, plan, T, I, beat, out, inc }) => {
   return E;
 };
 
-const loopRoll: Recipe = ({ b, plan, T, I, out, inc }) => {
-  const N = snapBeats(plan.beats, 2, 16, 2);
-  const R = Math.min(N, 8);
+/**
+ * Vraie boucle du sortant qui raccourcit (1, 1/2, 1/4, 1/8 temps : voir transitionLoopActions,
+ * exécutées par le Mixer), passe-haut qui monte, un peu d'écho sur le dernier temps, puis
+ * l'entrant tombe plein sur le 1 et le sortant est coupé.
+ */
+const loopRoll: Recipe = ({ b, plan, T, I, beat, out, inc }) => {
+  const { total: N, roll: R } = transitionRollBeats(plan);
   const E = T(N);
-  const depth = 0.8 + 0.2 * I;
   initDecks(b, plan, {});
-  b.set('fx.gate.depth', T(0), 0).set('fx.gate.depth', T(N - R), depth).set('fx.gate.depth', E, 0);
-  b.set('fx.gate.rate', T(N - R), 2).set('fx.gate.rate', T(N - R / 2), 4).set('fx.gate.rate', T(N - R / 4), 8);
-  b.hold(dp(out, 'filter'), T(N - R)).ramp(dp(out, 'filter'), E, 0.15 + 0.35 * I);
+  b.hold(dp(out, 'filter'), T(N - R)).ramp(dp(out, 'filter'), E, 0.25 + 0.45 * I);
+  b.set('fx.echo.time', T(0), beat / 2);
+  b.set('fx.echo.feedback', T(0), ECHO_FEEDBACK_NEUTRAL).set('fx.echo.feedback', T(N - 1), 0.5);
+  b.set(dp(out, 'echoSend'), T(N - 1), 0.3 + 0.4 * I);
+  b.hold('fx.echo.feedback', E + 2 * beat).ramp('fx.echo.feedback', E + 6 * beat, ECHO_FEEDBACK_NEUTRAL);
   if (I > 0.5) {
     b.set('fx.noise.filter', T(N - R), 400).ramp('fx.noise.filter', E, 7000, 'exp');
     b.set('fx.noise.gain', T(N - R), 0).ramp('fx.noise.gain', E, 0.3 * I).ramp('fx.noise.gain', E + 0.03, 0);
@@ -444,6 +450,30 @@ export function fxToAutomation(cue: FxCue): AutomationLane[] {
     case 'gate': {
       b.set('fx.gate.rate', t0, A < 0.5 ? 2 : 4);
       b.set('fx.gate.depth', t0, 0).set('fx.gate.depth', t0 + 1e-3, 0.6 + 0.4 * A).set('fx.gate.depth', t1, 0);
+      break;
+    }
+    case 'loop': {
+      // la boucle elle-même est pilotée par l'échantillonneur (fxLoopActions) : pas d'automation
+      break;
+    }
+    case 'loop-roll': {
+      const cutEnd = loopRollCut(cue);
+      const back = cutEnd ? t1 + beat : t1;
+      for (const d of decks) {
+        const f = dp(d, 'filter');
+        b.set(f, t0, 0).ramp(f, t1, 0.3 + 0.5 * A).set(f, back, 0);
+        const e = dp(d, 'echoSend');
+        const lastBeat = Math.max(t0, t1 - beat);
+        b.set(e, t0, 0).set(e, lastBeat, 0.3 + 0.4 * A).set(e, t1, 0);
+      }
+      if (cutEnd) {
+        // un temps de silence après le roll (sur le master si la cible est le master)
+        const g: ParamTarget = cue.target === 'master' ? 'master.gain' : dp(cue.target, 'gain');
+        b.set(g, t0, 1).set(g, t1, 0).set(g, back, 1);
+      }
+      b.set('fx.echo.time', t0, beat / 2);
+      b.set('fx.echo.feedback', t0, ECHO_FEEDBACK_NEUTRAL).set('fx.echo.feedback', Math.max(t0, t1 - beat), 0.5);
+      b.hold('fx.echo.feedback', t1 + beat).ramp('fx.echo.feedback', t1 + 4 * beat, ECHO_FEEDBACK_NEUTRAL);
       break;
     }
     case 'brake': {

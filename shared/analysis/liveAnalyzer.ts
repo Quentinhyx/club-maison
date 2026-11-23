@@ -12,7 +12,9 @@ import { LiveBeatTracker } from './live';
 const WORKLET_NAME = 'club-maison-capture';
 const FRAME = 1024;
 
-const WORKLET_SRC = `
+/** Source du processeur de capture : exportée pour en faire un vrai fichier quand la CSP interdit
+ *  les Blob URL (extension Chrome MV3), voir l'option `workletUrl`. */
+export const LIVE_WORKLET_SRC = `
 class CaptureProcessor extends AudioWorkletProcessor {
   constructor() {
     super();
@@ -46,11 +48,14 @@ registerProcessor('${WORKLET_NAME}', CaptureProcessor);
 
 const workletLoads = new WeakMap<BaseAudioContext, Promise<void>>();
 
-function loadWorklet(ctx: AudioContext): Promise<void> {
+function loadWorklet(ctx: AudioContext, fileUrl?: string): Promise<void> {
   let p = workletLoads.get(ctx);
   if (!p) {
-    const url = URL.createObjectURL(new Blob([WORKLET_SRC], { type: 'application/javascript' }));
-    p = ctx.audioWorklet.addModule(url).finally(() => URL.revokeObjectURL(url));
+    if (fileUrl) p = ctx.audioWorklet.addModule(fileUrl);
+    else {
+      const url = URL.createObjectURL(new Blob([LIVE_WORKLET_SRC], { type: 'application/javascript' }));
+      p = ctx.audioWorklet.addModule(url).finally(() => URL.revokeObjectURL(url));
+    }
     workletLoads.set(ctx, p);
   }
   return p;
@@ -60,6 +65,8 @@ export interface LiveAnalyzerOptions {
   bpmHint?: number;
   /** 'auto' (défaut) : worklet puis repli analyser. */
   mode?: 'auto' | 'worklet' | 'analyser';
+  /** URL d'un vrai fichier contenant LIVE_WORKLET_SRC (CSP sans Blob URL, ex. extension MV3). */
+  workletUrl?: string;
 }
 
 export class LiveAnalyzer {
@@ -83,13 +90,18 @@ export class LiveAnalyzer {
     this.sink.connect(ctx.destination);
     const mode = opts.mode ?? 'auto';
     if (mode !== 'analyser' && typeof AudioWorkletNode !== 'undefined' && ctx.audioWorklet) {
-      loadWorklet(ctx).then(
+      loadWorklet(ctx, opts.workletUrl).then(
         () => { if (!this.disposed) this.startWorklet(); },
         () => { if (!this.disposed) this.startAnalyser(); },
       );
     } else {
       this.startAnalyser();
     }
+  }
+
+  /** Mode de capture effectif : 'worklet', 'analyser' (repli) ou 'pending' (chargement). */
+  get captureMode(): 'worklet' | 'analyser' | 'pending' {
+    return this.worklet ? 'worklet' : this.analyser ? 'analyser' : 'pending';
   }
 
   getState(): LiveAnalysis | undefined {

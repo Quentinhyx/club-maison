@@ -9,15 +9,18 @@ import { getBridge } from '../deezer/bridge';
 import { captureTab, findInputDevice, unlockDeviceLabels } from '../deezer/capture';
 import type { DiagReport, TabInfo } from '../deezer/protocol';
 import { isExtension } from '../lib/env';
+import { Mixer } from '../../../shared/audio/index';
+import { LiveAnalyzer } from '../../../shared/analysis/index';
 import './diagnostic.css';
 
 type St = 'idle' | 'run' | 'ok' | 'warn' | 'fail';
 interface Res { st: St; title: string; detail?: string; advice?: string; extra?: string[] }
 
-const STEPS = ['incognito', 'tabs', 'player-A', 'player-B', 'rate', 'capture-A', 'capture-B', 'both', 'blackhole'] as const;
+const STEPS = ['audio', 'incognito', 'tabs', 'player-A', 'player-B', 'rate', 'capture-A', 'capture-B', 'both', 'blackhole'] as const;
 type Step = (typeof STEPS)[number];
 
 const TITLES: Record<Step, string> = {
+  audio: 'Moteur audio précis (worklets de boucle et d’analyse)',
   incognito: 'Extension autorisée en navigation privée',
   tabs: 'Deux onglets Deezer, deux comptes différents',
   'player-A': 'Platine A : lecteur Deezer détecté',
@@ -72,6 +75,28 @@ function App() {
         set('incognito', { st: 'fail', detail: 'Cette page n’est pas ouverte depuis l’extension Chrome.', advice: 'Installe l’extension (voir la notice ci-dessous) puis ouvre l’assistant depuis la console de l’extension.' });
       }
       const b = isExtension ? getBridge() : undefined;
+      if (want('audio')) {
+        set('audio', { st: 'run' });
+        const ctx = new AudioContext();
+        try {
+          const url = (f: string) => (isExtension ? chrome.runtime.getURL(f) : undefined);
+          const mixer = new Mixer(ctx, { workletUrl: url('worklets/loop.js') });
+          await mixer.ready.catch(() => {});
+          const an = new LiveAnalyzer(ctx, mixer.getDeckTap('A'), { workletUrl: url('worklets/live-capture.js') });
+          await sleep(800);
+          const loop = mixer.getLoopEngine();
+          const live = an.captureMode;
+          an.dispose();
+          mixer.dispose();
+          const extra = [`Échantillonneur de boucles : ${loop === 'worklet' ? 'AudioWorklet' : 'repli ScriptProcessor (±20 ms)'}`, `Analyse en direct : ${live === 'worklet' ? 'AudioWorklet' : live === 'analyser' ? 'repli AnalyserNode (moins précis)' : 'en chargement'}`];
+          if (loop === 'worklet' && live === 'worklet') set('audio', { st: 'ok', detail: 'Boucles et analyse tournent dans le moteur audio (précision à l’échantillon).', extra });
+          else set('audio', { st: 'warn', detail: 'Un module tourne en mode de repli : ça marche, en moins précis.', advice: 'Recharge l’extension (chrome://extensions) ; si ça persiste, signale-le.', extra });
+        } catch (e) {
+          set('audio', { st: 'fail', detail: (e as Error).message });
+        } finally {
+          void ctx.close();
+        }
+      }
       if (b && want('incognito')) {
         set('incognito', { st: 'run' });
         const ok = await chrome.extension.isAllowedIncognitoAccess();

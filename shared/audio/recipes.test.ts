@@ -8,6 +8,9 @@ import type {
 } from '../contracts';
 import { camelotRootMidi, grooveSchedule, retimeGroove } from './groove';
 import {
+  LOOP_WORKLET_SRC, LoopCore, fxLoopActions, loopRollSchedule, loopWindow, microFade, transitionLoopActions,
+} from './loop';
+import {
   DECK_PARAMS, DECK_PARAM_SPECS, EQ_KILL_DB, MASTER_PARAM_SPECS, djFilterToNodes, interp,
   isDeckTarget, paramSpec, renderGate, valueAt,
 } from './params';
@@ -31,7 +34,7 @@ const TECHNIQUES: TransitionTechnique[] = [
   'long-blend', 'bass-swap', 'filter-swap', 'echo-out', 'cut', 'riser-drop', 'reverb-wash', 'loop-roll', 'brake',
 ];
 const BLENDS = new Set<TransitionTechnique>(['long-blend', 'bass-swap', 'filter-swap', 'reverb-wash']);
-const FX_KINDS: FxKind[] = ['echo-throw', 'reverb-throw', 'filter-sweep', 'low-cut', 'riser', 'impact', 'gate', 'brake'];
+const FX_KINDS: FxKind[] = ['echo-throw', 'reverb-throw', 'filter-sweep', 'low-cut', 'riser', 'impact', 'gate', 'brake', 'loop-roll'];
 
 function mkPlan(technique: TransitionTechnique, o: Partial<TransitionPlan> = {}): TransitionPlan {
   return {
@@ -227,15 +230,28 @@ test('riser-drop : un temps de silence puis entrant sur le 1, bruit coupé au si
   assert.ok(val(lanes, 'A.reverbSend', E - beat - 0.01, 0) > 0.3, 'pas de queue de réverb');
 });
 
-test('loop-roll : gate 1/2 puis 1/4 puis 1/8, coupé sur le drop', () => {
-  const plan = mkPlan('loop-roll', { beats: 8 });
-  const lanes = planToAutomation(plan);
-  const beat = 60 / plan.bpm;
-  const s = plan.startCtx;
-  const r = (b: number) => val(lanes, 'fx.gate.rate', s + b * beat, 0);
-  assert.deepEqual([r(1), r(5), r(7)], [2, 4, 8]);
-  assert.ok(val(lanes, 'fx.gate.depth', s + 7.5 * beat, 0) > 0.7);
-  assert.equal(val(lanes, 'fx.gate.depth', s + 8 * beat + 0.001, 1), 0);
+test('loop-roll (transition) : vraie boucle du sortant qui accélère, passe-haut, entrant plein sur le 1', () => {
+  for (const beats of [8, 16, 4]) {
+    const plan = mkPlan('loop-roll', { beats, intensity: 0.7 });
+    const lanes = planToAutomation(plan);
+    const beat = 60 / plan.bpm;
+    const E = plan.startCtx + beats * beat;
+    const acts = transitionLoopActions(plan);
+    const R = Math.min(beats, 8);
+    assert.equal(acts[0].action, 'hold');
+    assert.ok(Math.abs(acts[0].t - (E - R * beat)) < 1e-9, 'le roll ne démarre pas R temps avant le 1');
+    const lens = acts.filter((x) => x.action !== 'release').map((x) => (x as { beats: number }).beats);
+    assert.deepEqual(lens, [1, 0.5, 0.25, 0.125].slice(0, lens.length));
+    assert.ok(lens.length >= 3, `roll trop court : ${lens}`);
+    const rel = acts[acts.length - 1];
+    assert.equal(rel.action, 'release');
+    assert.ok(rel.t > E && rel.t < E + 0.1, 'relâche pas juste après le 1');
+    assert.ok(val(lanes, 'A.filter', E - 0.001, 0) > 0.4, 'pas de passe-haut');
+    assert.ok(val(lanes, 'A.echoSend', E - beat / 2, 0) > 0.3, "pas d'écho à la fin");
+    assert.equal(val(lanes, 'B.gain', E + 0.01, 0), 1);
+    assert.equal(val(lanes, 'A.gain', E + 0.01, 1), 0);
+    assert.ok(!lane(lanes, 'fx.gate.depth'), 'le gate ne doit plus servir au roll');
+  }
 });
 
 test('brake : fader qui tombe et passe-bas qui se ferme', () => {
@@ -507,6 +523,157 @@ test('rateRamp : extrémités, monotone, paliers dans le temps', () => {
   assert.equal(down.length, 9);
   for (let i = 1; i < down.length; i++) assert.ok(down[i].rate <= down[i - 1].rate);
   assert.deepEqual(rateRamp(1, 1.05, 3, 0, 120), [{ t: 3, rate: 1.05 }]);
+});
+
+
+console.log('\nBoucles (échantillonneur)');
+
+test('loopRollSchedule : 1 -> 1/2 -> 1/4 -> 1/8, sur la grille, avant la fin', () => {
+  for (const [beats, L0] of [[8, 1], [4, 1], [2, 1], [16, 2], [3, 1], [8, 4]] as const) {
+    const s0 = 20;
+    const bpm = 126;
+    const beat = 60 / bpm;
+    const sch = loopRollSchedule(s0, beats, bpm, L0);
+    assert.equal(sch[0].t, s0);
+    assert.equal(sch[0].len, L0);
+    for (let i = 1; i < sch.length; i++) {
+      assert.equal(sch[i].len, sch[i - 1].len / 2, 'longueurs pas divisées par 2');
+      const b = (sch[i].t - s0) / beat;
+      const k = b / sch[i].len;
+      assert.ok(Math.abs(k - Math.round(k)) < 1e-6, `bascule hors grille (${b} temps, len ${sch[i].len})`);
+      const prevB = (sch[i - 1].t - s0) / beat;
+      assert.ok(b - prevB >= sch[i - 1].len - 1e-9, 'boucle précédente pas jouée en entier');
+      assert.ok(b < beats, 'bascule après la fin');
+    }
+    if (beats >= 2 && L0 === 1) assert.ok(sch.length >= 3, `roll ${beats} temps trop court`);
+  }
+});
+
+test('loopWindow : indices, enroulement, disponibilité', () => {
+  const sr = 1000;
+  const N = 16000; // 16 s
+  const w = loopWindow({ bufferFrames: N, sampleRate: sr, originTime: 2, writtenAbs: 20000, startCtx: 19.5, endCtx: 20.5 });
+  assert.equal(w.startAbs, 17500);
+  assert.equal(w.endAbs, 18500);
+  assert.equal(w.frames, 1000);
+  assert.equal(w.startIndex, 1500);
+  assert.equal(w.endIndex, 2500);
+  assert.equal(w.wraps, false);
+  assert.equal(w.available, true);
+  const w2 = loopWindow({ bufferFrames: N, sampleRate: sr, originTime: 0, writtenAbs: 33000, startCtx: 31.5, endCtx: 32.5 });
+  assert.equal(w2.startIndex, 15500);
+  assert.equal(w2.endIndex, 500);
+  assert.equal(w2.wraps, true);
+  assert.equal(w2.available, true);
+  // trop vieux (écrasé) ou pas encore écrit
+  assert.equal(loopWindow({ bufferFrames: N, sampleRate: sr, originTime: 0, writtenAbs: 33000, startCtx: 10, endCtx: 11 }).available, false);
+  assert.equal(loopWindow({ bufferFrames: N, sampleRate: sr, originTime: 0, writtenAbs: 33000, startCtx: 32.5, endCtx: 33.5 }).available, false);
+});
+
+test('microFade : gain constant', () => {
+  for (let x = -0.2; x <= 1.2; x += 0.1) {
+    const f = microFade(x);
+    assert.ok(Math.abs(f.out + f.in - 1) < 1e-12 && f.in >= 0 && f.in <= 1);
+  }
+});
+
+/** Simule le moteur : signal sinusoïdal écrit et rendu par blocs de 128. */
+function simulate(core: LoopCore, sig: (t: number) => number, t0: number, t1: number, sr: number): { t: number; v: number }[] {
+  const out: { t: number; v: number }[] = [];
+  const n = 128;
+  for (let k = 0; t0 + (k * n) / sr < t1; k++) {
+    const start = t0 + (k * n) / sr;
+    const inp = new Float32Array(n);
+    for (let i = 0; i < n; i++) inp[i] = sig(start + i / sr);
+    core.write([inp, inp], start);
+    const o = [new Float32Array(n), new Float32Array(n)];
+    core.render(o, start);
+    for (let i = 0; i < n; i++) out.push({ t: start + i / sr, v: o[0][i] });
+  }
+  return out;
+}
+
+test('LoopCore : rejoue la bonne fenêtre, sans clic au bouclage, au changement de longueur et au relâché', () => {
+  const sr = 48000;
+  const f = 219.7; // nombre de périodes non entier dans la boucle : le bouclage serait un clic sans fondu
+  const sig = (t: number) => 0.8 * Math.sin(2 * Math.PI * f * t);
+  const core = new LoopCore(sr, 16, 2);
+  const bpm = 125;
+  const beat = 60 / bpm;
+  const holdAt = 3.1234; // pas aligné sur un bloc
+  const len = 1 * beat;
+  core.schedule({ from: holdAt, winStart: holdAt - len, len, anchor: holdAt });
+  core.schedule({ from: holdAt + 2 * beat, winStart: holdAt - len, len: len / 2, anchor: holdAt });
+  core.schedule({ from: holdAt + 3 * beat, off: true, winStart: 0, len: 1, anchor: holdAt });
+  const out = simulate(core, sig, 0, holdAt + 4 * beat, sr);
+  // contenu : juste après le départ, on entend la fenêtre [holdAt - len, ...[
+  for (const x of [0.01, 0.1, 0.3]) {
+    const p = out.find((o) => o.t >= holdAt + x)!;
+    assert.ok(Math.abs(p.v - sig(p.t - len)) < 2e-3, `mauvais contenu à +${x} s`);
+  }
+  // pendant la boucle d'un demi-temps : période len/2
+  const tq = holdAt + 2 * beat + 0.05;
+  const q = out.find((o) => o.t >= tq)!;
+  const q2 = out.find((o) => o.t >= tq + len / 2 - 1e-6)!;
+  assert.ok(Math.abs(q.v - q2.v) < 0.03, 'la boucle courte ne se répète pas');
+  // continuité : aucun saut d'échantillon à échantillon au-delà de ce que permet le fondu
+  const maxStep = 2 * Math.PI * f * 0.8 / sr; // pente maxi du signal
+  let worst = 0;
+  for (let i = 1; i < out.length; i++) {
+    if (out[i].t < holdAt + 1e-4) continue; // avant la boucle : sortie muette, le gain direct fait le travail
+    worst = Math.max(worst, Math.abs(out[i].v - out[i - 1].v));
+  }
+  assert.ok(worst < maxStep + 2 * 0.8 / (0.005 * sr) + 1e-3, `clic : saut de ${worst.toFixed(4)}`);
+  // relâché : silence après le fondu
+  assert.ok(out.filter((o) => o.t > holdAt + 3 * beat + 0.006).every((o) => o.v === 0), 'boucle pas coupée au relâché');
+});
+
+test('LOOP_WORKLET_SRC : la source sérialisée tourne comme LoopCore', () => {
+  let Proc: (new () => { port: { onmessage: (e: { data: unknown }) => void }; process: (i: Float32Array[][], o: Float32Array[][]) => boolean }) | undefined;
+  class FakeAWP { port = { onmessage: (_e: { data: unknown }) => undefined as void, postMessage() {} }; }
+  const sr = 48000;
+  const scope = { frame: 0 };
+  const run = new Function('AudioWorkletProcessor', 'registerProcessor', 'sampleRate', 'scope',
+    `with (scope) { ${LOOP_WORKLET_SRC.replace(/currentFrame/g, 'scope.frame')} }`);
+  run(FakeAWP, (_n: string, c: typeof Proc) => { Proc = c; }, sr, scope);
+  assert.ok(Proc, 'registerProcessor pas appelé');
+  const p = new Proc!();
+  const ref = new LoopCore(sr, 16, 2);
+  const seg = { from: 0.5, winStart: 0.3, len: 0.2, anchor: 0.5 };
+  p.port.onmessage({ data: { type: 'segment', seg } });
+  ref.schedule(seg);
+  let maxDiff = 0;
+  for (let k = 0; k < 400; k++) {
+    const t = (k * 128) / sr;
+    const inp = new Float32Array(128).map((_, i) => Math.sin(2 * Math.PI * 330 * (t + i / sr)));
+    const o1 = [new Float32Array(128), new Float32Array(128)];
+    const o2 = [new Float32Array(128), new Float32Array(128)];
+    scope.frame = k * 128;
+    p.process([[inp, inp]], [o1]);
+    ref.write([inp, inp], t);
+    ref.render(o2, t);
+    for (let i = 0; i < 128; i++) maxDiff = Math.max(maxDiff, Math.abs(o1[0][i] - o2[0][i]));
+  }
+  assert.ok(maxDiff < 1e-9, `écart worklet / LoopCore : ${maxDiff}`);
+});
+
+test('fxLoopActions : loop (hold puis release) et loop-roll (raccourcit, coupure si amount fort)', () => {
+  const beat = 60 / 128;
+  const loop = fxLoopActions({ kind: 'loop', target: 'A', atCtx: 10, beats: 4, bpm: 128, amount: 0.5, loopBeats: 0.5 });
+  assert.deepEqual(loop.map((a) => a.action), ['hold', 'release']);
+  assert.equal((loop[0] as { beats: number }).beats, 0.5);
+  assert.ok(Math.abs(loop[1].t - (10 + 4 * beat)) < 1e-9);
+  const soft = fxLoopActions({ kind: 'loop-roll', target: 'B', atCtx: 10, beats: 8, bpm: 128, amount: 0.3 });
+  assert.equal(soft[0].action, 'hold');
+  assert.ok(soft.filter((a) => a.action === 'len').length >= 2);
+  assert.ok(Math.abs(soft[soft.length - 1].t - (10 + 8 * beat)) < 1e-9, 'release pas à la fin');
+  const hard = fxLoopActions({ kind: 'loop-roll', target: 'B', atCtx: 10, beats: 8, bpm: 128, amount: 0.9 });
+  assert.ok(Math.abs(hard[hard.length - 1].t - (10 + 9 * beat)) < 1e-9, 'pas de coupure d’un temps');
+  const lanes = fxToAutomation({ kind: 'loop-roll', target: 'B', atCtx: 10, beats: 8, bpm: 128, amount: 0.9 });
+  assert.equal(val(lanes, 'B.gain', 10 + 8.5 * beat, 1), 0, 'coupure absente');
+  assert.equal(val(lanes, 'B.gain', 10 + 9 * beat + 0.001, 0), 1);
+  assert.ok(val(lanes, 'B.filter', 10 + 8 * beat - 0.001, 0) > 0.5, 'pas de passe-haut qui monte');
+  assert.deepEqual(fxLoopActions({ kind: 'gate', target: 'A', atCtx: 0, beats: 4, bpm: 120, amount: 1 }), []);
 });
 
 console.log(`\n${passed} réussi(s), ${failed} échec(s)\n`);

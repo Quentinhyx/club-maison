@@ -10,7 +10,7 @@ import { MODE_LABELS } from '../engine';
 import { isExtension } from '../lib/env';
 import { qrPageUrl } from '../lib/guestApi';
 import type { ConsoleSettings, DeckMode } from '../lib/storage';
-import { fmtTime } from './labels';
+import { STYLE_LABELS, fmtTime, styleOrder } from './labels';
 import { DeezerTabsPanel } from './DeezerTabsPanel';
 
 type Tab = 'queue' | 'log' | 'guests' | 'settings';
@@ -278,11 +278,13 @@ function GuestsTab({ engine, snap, settings }: Props) {
 function SettingsTab({ engine, settings, onSaveSettings }: Props) {
   const [s, setS] = useState<ConsoleSettings>(settings);
   const [dj, setDj] = useState<DjSettings>(engine.conductor.getSettings());
-  const upd = (patch: Partial<DjSettings>) => {
+  const upd = (patch: Partial<DjSettings>, extra: Partial<ConsoleSettings> = {}) => {
     const next = { ...dj, ...patch };
     setDj(next);
     engine.conductor.setSettings(patch);
-    onSaveSettings({ ...s, dj: next }, false);
+    const ns = { ...s, ...extra, dj: next };
+    setS(ns);
+    onSaveSettings(ns, false);
   };
   const modeChanged = s.deckMode !== engine.mode || s.captureMode !== settings.captureMode;
   return (
@@ -291,10 +293,10 @@ function SettingsTab({ engine, settings, onSaveSettings }: Props) {
         <div className="s-head">Pilote</div>
         <label>
           Style
-          <select value={dj.style} onChange={(e) => upd({ style: e.target.value as StyleProfileId })}>
-            {Object.values(STYLE_PROFILES).map((p) => (
-              <option key={p.id} value={p.id}>
-                {p.label}
+          <select value={dj.style} onChange={(e) => upd({ style: e.target.value as StyleProfileId }, { styleTouched: true })}>
+            {styleOrder(Object.keys(STYLE_PROFILES) as StyleProfileId[]).map((id) => (
+              <option key={id} value={id}>
+                {STYLE_LABELS[id] ?? STYLE_PROFILES[id]?.label ?? id}
               </option>
             ))}
           </select>

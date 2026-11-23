@@ -24,6 +24,19 @@ export function TransitionBar({ engine, running }: { engine: Engine; running: bo
     // une fois la transition finie (relâchement de la vitesse), on repasse à l'écoute
     const tr = tr0 && f.now <= tr0.endCtx + 0.5 ? tr0 : undefined;
     const root = e.root;
+    const skipAt = engine.conductor.getSkipRequestedAt();
+    const skipFresh = skipAt !== undefined && Date.now() - skipAt < 12000;
+    if (e.skip) {
+      let s = '';
+      if (skipFresh) {
+        if (tr0 && tr0.plan.startCtx > f.now) {
+          const beats = Math.max(0, Math.ceil((tr0.plan.startCtx - f.now) / (60 / tr0.plan.bpm)));
+          s = `SUIVANT DEMANDÉ · sortie dans ${beats} temps`;
+        } else if (tr0) s = 'SUIVANT · transition en cours';
+        else s = 'SUIVANT DEMANDÉ…';
+      }
+      if (e.skip.textContent !== s) e.skip.textContent = s;
+    }
     if (!tr) {
       if (root) root.dataset.state = 'idle';
       txt('kicker', running ? 'PROCHAINE TRANSITION' : 'EN ATTENTE');
@@ -85,6 +98,7 @@ export function TransitionBar({ engine, running }: { engine: Engine; running: bo
       <div className="tr-right">
         <span className="count mono" ref={set('count')} />
         <span className="fx mono" ref={set('fx')} />
+        <span className="skip mono" ref={set('skip')} />
       </div>
     </section>
   );

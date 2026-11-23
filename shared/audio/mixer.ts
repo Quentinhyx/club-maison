@@ -21,6 +21,14 @@ import {
   generateImpulse, interp, paramSpec, renderGate, sortPoints, valueAtPoints,
 } from './params';
 import { fxToAutomation, transitionLanes } from './recipes';
+import { LOOP_WORKLET_SRC, fxLoopActions, transitionLoopActions, type LoopAction } from './loop';
+import { LoopSampler } from './loop-sampler';
+
+export interface MixerOptions {
+  /** URL d'un fichier contenant LOOP_WORKLET_SRC (obligatoire en extension MV3 : la CSP refuse les
+   *  Blob URL). Absente : essai en Blob URL, et repli sur ScriptProcessor si refusé. */
+  workletUrl?: string;
+}
 
 interface Binding {
   param: AudioParam;
@@ -42,6 +50,7 @@ interface Strip {
   echoSend: GainNode;
   reverbSend: GainNode;
   meter: AnalyserNode;
+  sampler: LoopSampler;
 }
 
 const GATE_TARGETS = new Set<ParamTarget>(['fx.gate.depth', 'fx.gate.rate']);
@@ -76,8 +85,10 @@ export class Mixer {
   private grooveDeck?: DeckId;
   private bpm = 124;
   private disposed = false;
+  /** Résolue quand l'échantillonneur a choisi son moteur (worklet chargé, ou repli ScriptProcessor). */
+  readonly ready: Promise<void>;
 
-  constructor(ctx: AudioContext) {
+  constructor(ctx: AudioContext, opts: MixerOptions = {}) {
     this.ctx = ctx;
     const nyq = ctx.sampleRate / 2;
     const reg = <T extends AudioNode>(n: T): T => (this.nodes.push(n), n);
@@ -143,9 +154,10 @@ export class Mixer {
     this.noiseSrc.start();
 
     // ---------------- tranches ----------------
-    const mkStrip = (): Strip => {
+    const mkStrip = (d: DeckId): Strip => {
       const s: Strip = {
         ownsSource: false,
+        sampler: undefined as unknown as LoopSampler,
         trim: gain(1),
         eqLow: biquad('lowshelf', 120, 0.7071, 0),
         eqMid: biquad('peaking', 1000, 0.9, 0),
@@ -157,14 +169,17 @@ export class Mixer {
         reverbSend: gain(0),
         meter: reg(new AnalyserNode(ctx, { fftSize: 1024, smoothingTimeConstant: 0 })),
       };
-      s.trim.connect(s.eqLow).connect(s.eqMid).connect(s.eqHigh).connect(s.hp).connect(s.lp).connect(s.fader);
+      // trim -> [direct + boucle] -> EQ : transitions et effets s'appliquent aussi à la boucle
+      s.sampler = new LoopSampler(d, ctx, s.trim, s.eqLow);
+      s.eqLow.connect(s.eqMid).connect(s.eqHigh).connect(s.hp).connect(s.lp).connect(s.fader);
       s.fader.connect(bus);
       s.fader.connect(s.meter);
       s.fader.connect(s.echoSend).connect(echoIn);
       s.fader.connect(s.reverbSend).connect(revIn);
       return s;
     };
-    this.strips = { A: mkStrip(), B: mkStrip() };
+    this.strips = { A: mkStrip('A'), B: mkStrip('B') };
+    this.ready = this.loadWorklet(opts.workletUrl);
 
     // ---------------- canal groove (boîte à rythmes des re-edits) ----------------
     this.groove = new GrooveMachine(ctx);
@@ -320,6 +335,8 @@ export class Mixer {
     this.setTempo(plan.bpm);
     const lanes = transitionLanes(plan);
     this.schedule(lanes);
+    this.runLoopActions(plan.from, transitionLoopActions(plan), plan.bpm);
+    for (const cue of plan.accents ?? []) this.runCueLoops(cue);
     return lanes;
   }
 
@@ -335,7 +352,74 @@ export class Mixer {
       return !rec.some((p) => p.t > first + 1e-6);
     });
     this.schedule(lanes);
+    this.runCueLoops(cue);
     return lanes;
+  }
+
+  // -------------------------------------------------------------------------------------------
+  // Boucles (échantillonneur par platine)
+  // -------------------------------------------------------------------------------------------
+
+  /** À atCtx (sur un temps), coupe le direct et rejoue les `beats` derniers temps captés. */
+  holdLoop(deck: DeckId, opts: { atCtx: number; beats: number; bpm: number }): void {
+    if (this.disposed) return;
+    this.strips[deck].sampler.hold(opts.atCtx, opts.beats, opts.bpm);
+  }
+
+  /** Change la longueur de la boucle au prochain temps (division de temps si beats < 1). Renvoie
+   *  l'instant effectif, ou null si la platine ne boucle pas. */
+  setLoopLength(deck: DeckId, beats: number, atCtx: number): number | null {
+    if (this.disposed) return null;
+    return this.strips[deck].sampler.setLength(beats, atCtx);
+  }
+
+  /** Retour au direct à atCtx (fondu de 5 ms). */
+  releaseLoop(deck: DeckId, atCtx: number): void {
+    if (this.disposed) return;
+    this.strips[deck].sampler.release(atCtx);
+  }
+
+  isLooping(deck: DeckId): boolean {
+    return !this.disposed && this.strips[deck].sampler.isLooping();
+  }
+
+  /** Moteur de l'échantillonneur (diagnostic). */
+  getLoopEngine(): 'worklet' | 'script-processor' {
+    return this.strips.A.sampler.engine;
+  }
+
+  /**
+   * Filet de sécurité contre les blancs : si isReady() est faux à atCtx, boucle la dernière mesure
+   * (4 temps) de la platine, revérifie ~60 ms avant chaque temps, et relâche sur le premier temps où
+   * isReady() est vrai (au plus maxBeats temps). Renvoie l'instant ctx de relâche (atCtx si prêt).
+   */
+  async holdUntil(deck: DeckId, atCtx: number, bpm: number, isReady: () => boolean, maxBeats = 16): Promise<number> {
+    const beat = 60 / (bpm > 0 ? bpm : 120);
+    const margin = 0.06;
+    const ready = () => {
+      try {
+        return !!isReady();
+      } catch {
+        return false;
+      }
+    };
+    await this.waitCtx(atCtx - margin);
+    if (this.disposed || ready()) return atCtx;
+    // en retard sur l'instant prévu : on boucle à partir du prochain temps de la même grille
+    const now = this.ctx.currentTime;
+    const start = now < atCtx - 0.005 ? atCtx : atCtx + Math.ceil((now + 0.01 - atCtx) / beat) * beat;
+    this.holdLoop(deck, { atCtx: start, beats: 4, bpm });
+    const limit = Math.max(1, Math.round(maxBeats));
+    for (let k = 1; k <= limit; k++) {
+      const t = start + k * beat;
+      await this.waitCtx(t - margin);
+      if (this.disposed) return t;
+      if (ready() || k === limit) {
+        this.releaseLoop(deck, t);
+        return t;
+      }
+    }
+    return start;
   }
 
   getLevels(): { A: number; B: number; master: number; groove?: number } {
@@ -421,6 +505,8 @@ export class Mixer {
     if (this.disposed) return;
     this.disposed = true;
     this.groove.dispose();
+    this.strips.A.sampler.dispose();
+    this.strips.B.sampler.dispose();
     try {
       this.noiseSrc.stop();
     } catch {
@@ -447,6 +533,53 @@ export class Mixer {
   // -------------------------------------------------------------------------------------------
   // Interne
   // -------------------------------------------------------------------------------------------
+
+  private async loadWorklet(url?: string): Promise<void> {
+    const aw = (this.ctx as AudioContext & { audioWorklet?: AudioWorklet }).audioWorklet;
+    if (!aw || typeof AudioWorkletNode === 'undefined') return;
+    let blobUrl: string | undefined;
+    try {
+      if (!url) {
+        blobUrl = URL.createObjectURL(new Blob([LOOP_WORKLET_SRC], { type: 'application/javascript' }));
+      }
+      await aw.addModule(url ?? blobUrl!);
+      if (this.disposed) return;
+      this.strips.A.sampler.useWorklet();
+      this.strips.B.sampler.useWorklet();
+    } catch {
+      // CSP ou navigateur : on reste sur le ScriptProcessor
+    } finally {
+      if (blobUrl) URL.revokeObjectURL(blobUrl);
+    }
+  }
+
+  private runLoopActions(deck: DeckId, acts: LoopAction[], bpm: number): void {
+    for (const a of acts) {
+      if (a.action === 'hold') this.holdLoop(deck, { atCtx: a.t, beats: a.beats, bpm });
+      else if (a.action === 'len') this.setLoopLength(deck, a.beats, a.t);
+      else this.releaseLoop(deck, a.t);
+    }
+  }
+
+  private runCueLoops(cue: FxCue): void {
+    const acts = fxLoopActions(cue);
+    if (!acts.length) return;
+    const decks: DeckId[] = cue.target === 'master' ? ['A', 'B'] : [cue.target];
+    for (const d of decks) this.runLoopActions(d, acts, cue.bpm);
+  }
+
+  /** Attend que l'horloge audio atteigne t (garde-fou horloge murale si le contexte est suspendu). */
+  private waitCtx(t: number): Promise<void> {
+    const wallLimit = performance.now() + Math.max(0, t - this.ctx.currentTime) * 1000 + 3000;
+    return new Promise((resolve) => {
+      const tick = () => {
+        const d = t - this.ctx.currentTime;
+        if (d <= 0.004 || this.disposed || performance.now() > wallLimit) resolve();
+        else setTimeout(tick, Math.max(4, Math.min(d * 1000 - 8, 100)));
+      };
+      tick();
+    });
+  }
 
   private valueAtTime(target: ParamTarget, t: number): number {
     return valueAtPoints(this.record.get(target) ?? [], t) ?? paramSpec(target).def;

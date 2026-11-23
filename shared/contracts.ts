@@ -22,6 +22,7 @@ export interface TrackRef {
   id: number;
   title: string;
   artist: string;
+  artistId?: number;     // id Deezer de l'artiste (radio, artistes proches)
   album?: string;
   cover?: string;        // URL pochette (cover_medium)
   duration: number;      // secondes, morceau complet
@@ -74,6 +75,38 @@ export interface TrackAnalysis {
   loudnessDb: number;       // RMS en dBFS de l'extrait
   genres: Genre[];
   analyzedAt: number;       // Date.now()
+  /** Structure du morceau COMPLET, quand il a été pré-écouté (scan accéléré, voir TrackScan). */
+  structure?: TrackStructure;
+}
+
+/** Une section repérée dans le morceau complet. Positions en secondes dans le morceau (vitesse 1). */
+export interface StructureSection { section: Section; startPos: number; endPos: number; energy: number }
+
+/** Structure du morceau complet issue du scan : grille de temps, phrases, sections, moments forts. */
+export interface TrackStructure {
+  bpm: number;
+  /** Position (s) d'un premier temps de mesure ; les temps suivants : firstDownbeatPos + k * 60/bpm. */
+  firstDownbeatPos: number;
+  phraseBeats: 16 | 32;
+  sections: StructureSection[];
+  /** Débuts des drops / refrains (s), du plus marquant au moins marquant. */
+  dropPositions: number[];
+  /** Début de l'outro (s), si repéré. */
+  outroPos?: number;
+  confidence: number;       // 0..1
+}
+
+/** Forme d'onde complète d'un morceau, par bande (enveloppes 0..1), pointsPerSecond points par seconde
+ *  de morceau (vitesse 1). Construite par computeWaveform (démo) ou par le scan accéléré (Deezer). */
+export interface TrackWaveform {
+  trackId: number;
+  pointsPerSecond: number;
+  low: Float32Array;
+  mid: Float32Array;
+  high: Float32Array;
+  peak: Float32Array;
+  /** Fraction du morceau déjà couverte (0..1) : le scan la remplit progressivement. */
+  coverage: number;
 }
 
 /** Analyse en direct d'une platine en cours de lecture (signal capté). */
@@ -207,6 +240,13 @@ export interface TransitionPlan {
   /** Calage du tempo : rate à appliquer sur l'entrant au départ, et retour progressif à 1 ensuite. */
   incomingRate: number;
   rateRelaxBeats?: number;
+  /** Nombre de temps pendant lesquels l'entrant tourne déjà, fader fermé, AVANT son entrée audible
+   *  (absorbe la latence de démarrage de Deezer et permet de caler la phase). La platine entrante est
+   *  donc lancée à incomingStartPos - preRollBeats * 60/bpm (borné à 0). Défaut côté chef d'orchestre : 8. */
+  preRollBeats?: number;
+  /** Filet de sécurité : si l'entrant n'est pas réellement en lecture au moment prévu, la table boucle le
+   *  dernier temps (ou mesure) du sortant jusqu'à ce qu'il le soit, au lieu de laisser un blanc. Défaut true. */
+  holdWithLoop?: boolean;
   /** Effets d'accompagnement ajoutés par le cerveau (en plus de la recette de base). */
   accents: FxCue[];
   /** Intensité générale 0..1 (dosage des effets dans la recette). */
@@ -222,7 +262,9 @@ export type FxKind =
   | 'riser'           // bruit blanc qui monte sur N temps
   | 'impact'          // retombée (downlifter) sur le 1
   | 'gate'            // stutter rythmique
-  | 'brake';
+  | 'brake'
+  | 'loop'            // vraie boucle : rejoue les derniers `loopBeats` temps captés de la platine (échantillonneur)
+  | 'loop-roll';      // boucle qui raccourcit (1 -> 1/2 -> 1/4 -> 1/8 temps) jusqu'au drop
 
 export interface FxCue {
   kind: FxKind;
@@ -231,6 +273,8 @@ export interface FxCue {
   beats: number;
   bpm: number;
   amount: number;           // 0..1
+  /** Pour 'loop' : longueur de la boucle en temps (4, 2, 1, 0.5, 0.25…). Pour 'loop-roll' : longueur de départ. */
+  loopBeats?: number;
   reason?: string;
 }
 
@@ -267,6 +311,8 @@ export interface HostSettings {
   votesOpen: boolean;
   requestsOpen: boolean;
   maxRequestsPerGuest: number;
+  /** « Suivant » demandé par l'hôte depuis son téléphone (Date.now()). La console traite chaque valeur une fois. */
+  skipAt?: number;
 }
 
 export interface NowPlaying {
@@ -300,7 +346,7 @@ export const DEFAULT_PARTY = 'maison';
 // Cerveau DJ
 // ---------------------------------------------------------------------------------------------
 
-export type StyleProfileId = 'paris-tech-house' | 'open-format' | 'lounge' | 'peak-time';
+export type StyleProfileId = 'soiree' | 'paris-tech-house' | 'open-format' | 'lounge' | 'peak-time';
 
 export interface DjSettings {
   style: StyleProfileId;
@@ -336,12 +382,16 @@ export interface BrainInput {
   /** Morceaux ajoutés à la main (hôte) ou acceptés (invités), dans l'ordre. */
   queue: QueueItem[];
   /** Candidats proposés par le catalogue pour le genre visé, déjà analysés si possible. */
-  candidates: Array<{ track: TrackRef; analysis?: TrackAnalysis; genre: Genre }>;
+  candidates: Array<{ track: TrackRef; analysis?: TrackAnalysis; genre: Genre; /** 'similar' = radio/artistes proches du morceau en cours */ source?: 'catalog' | 'similar' }>;
   crowd: CrowdState;
   settings: DjSettings;
   history: PlayedTrack[];
   /** Transition en cours, si la table en exécute une. */
   activeTransition?: TransitionPlan;
+  /** « Suivant » demandé (console ou téléphone de l'hôte) : Date.now() de la demande. Le cerveau sort du
+   *  morceau en cours au plus vite (prochaine mesure, transition courte), une seule fois par valeur, et
+   *  traite le zappage comme un avis négatif pour ajuster la suite du set. */
+  skipRequestedAt?: number;
   /** Analyses connues (file, candidats, platines), par trackId. */
   analyses?: Record<number, TrackAnalysis>;
 }

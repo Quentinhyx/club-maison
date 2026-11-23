@@ -3,7 +3,7 @@
  *  - morceaux démo : forme d'onde complète calculée sur le buffer (computeWaveform) ;
  *  - Deezer / extraits : construite en direct depuis le signal capté, indexée par position.
  */
-import type { DeckId, TrackRef } from '../../shared/contracts';
+import type { DeckId, TrackRef, TrackWaveform } from '../../shared/contracts';
 import { getDemoBuffer, isDemoTrack } from '../../shared/demo/index';
 import type { Bands } from './meters';
 
@@ -15,6 +15,7 @@ export interface Waveform {
   high: Float32Array;
   peak: Float32Array;
   full: boolean;          // true = calculée sur le morceau entier, false = remplie en direct
+  coverage?: number;      // pré-écoute : fraction déjà analysée
   filled?: Uint8Array;    // pour le direct : points déjà mesurés
 }
 
@@ -34,8 +35,18 @@ export class WaveformStore {
     private compute: ComputeFn,
   ) {}
 
+  /** Formes d'onde issues de la pré-écoute accélérée (Deezer), prioritaires sur l'onde en direct. */
+  external?: (id: number) => TrackWaveform | undefined;
+
   get(track?: TrackRef): Waveform | undefined {
     if (!track) return undefined;
+    const ext = this.external?.(track.id);
+    if (ext && ext.coverage > 0.02) {
+      const cur = this.byId.get(track.id);
+      if (!cur || !cur.full) {
+        return { trackId: track.id, pps: ext.pointsPerSecond, low: ext.low, mid: ext.mid, high: ext.high, peak: ext.peak, full: ext.coverage >= 0.98, coverage: ext.coverage };
+      }
+    }
     const w = this.byId.get(track.id);
     if (!w && !this.pending.has(track.id)) void this.prepare('A', track);
     return w;

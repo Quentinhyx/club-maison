@@ -36,7 +36,9 @@ export function techniqueWeights(c: TechniqueContext): Partial<Record<Transition
     mul('cut', 1.5); mul('echo-out', 1.3);
   }
   if (!c.beatReliable) {
-    for (const t of Object.keys(w) as TransitionTechnique[]) if (!NO_GRID_TECHNIQUES.has(t)) delete w[t];
+    for (const t of Object.keys(w) as TransitionTechnique[]) {
+      if (!NO_GRID_TECHNIQUES.has(t) && !(t === 'loop-roll' && c.profile.rollWithoutGrid)) delete w[t];
+    }
   } else if (!c.syncOk) {
     for (const t of SYNC_TECHNIQUES) delete w[t];
   }

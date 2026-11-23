@@ -6,7 +6,8 @@ import { useEffect, useRef } from 'react';
 import type { DeckId, TransitionPlan } from '../../../shared/contracts';
 import type { Engine } from '../engine';
 import type { Waveform } from '../waveforms';
-import type { GrooveView } from '../conductor';
+import type { GrooveView, LoopView } from '../conductor';
+import { fmtLoop } from './labels';
 import { beatIndexAt, getFrame, useFrame, type DeckView } from './frame';
 
 const C = {
@@ -62,6 +63,7 @@ export function WaveDisplay({ engine }: { engine: Engine }) {
     const ovH = 22;
     const waveH = Math.max(40, (h - 2 * ovH - 3 * gap) / 2);
     const now = f.now;
+    const loops = engine.conductor.getLoops();
 
     (['A', 'B'] as DeckId[]).forEach((id, i) => {
       const v = views[id];
@@ -69,8 +71,8 @@ export function WaveDisplay({ engine }: { engine: Engine }) {
       // forme d'onde en direct : on enregistre ce qu'on entend
       if (wf && !wf.full && v.playing) engine.waves.record(v.state.track, v.pos, engine.meters.bands(id));
       const y0 = i * (waveH + ovH + 2 * gap);
-      drawWave(g, 0, y0, w, waveH, v, wf, id, onAir === id, tr?.plan, now, engine.conductor.getGroove());
-      drawOverview(g, 0, y0 + waveH + gap * 0.6, w, ovH, v, wf, tr?.plan, now);
+      drawWave(g, 0, y0, w, waveH, v, wf, id, onAir === id, tr?.plan, now, engine.conductor.getGroove(), loops[id]);
+      drawOverview(g, 0, y0 + waveH + gap * 0.6, w, ovH, v, wf, tr?.plan, now, engine.conductor.getLoadStartAt(id), engine.conductor.getScan(id));
     });
 
     // tête de lecture
@@ -113,6 +115,7 @@ function drawWave(
   plan: TransitionPlan | undefined,
   now: number,
   groove?: GrooveView,
+  loop?: LoopView,
 ) {
   g.fillStyle = C.lane;
   g.fillRect(x0, y0, w, h);
@@ -158,7 +161,7 @@ function drawWave(
     }
     g.globalAlpha = 1;
     // le futur d'une onde en direct est inconnu : on l'indique
-    if (!wf.full) {
+    if (!wf.full && wf.coverage === undefined) {
       g.fillStyle = 'rgba(11,11,12,0.55)';
       g.fillRect(cx, y0, w / 2, h);
       g.fillStyle = C.dim;
@@ -200,6 +203,29 @@ function drawWave(
       const bEnd = Math.floor((v.pos + secHalf - origin) / period);
       for (let b = bStart; b <= bEnd; b++) line(b, origin + b * period);
     }
+  }
+
+  // portion bouclée : la mesure rejouée (avant le départ de la boucle) et la durée de la boucle
+  if (loop) {
+    const spb = 60 / loop.bpm;
+    const len = loop.beats * spb;
+    const xs = cx + (loop.atCtx - len - now) * pxPerSec;
+    const xe = cx + (loop.atCtx - now) * pxPerSec;
+    g.fillStyle = 'rgba(215,255,58,0.18)';
+    g.fillRect(xs, y0, Math.max(2, xe - xs), h);
+    g.fillStyle = 'rgba(215,255,58,0.06)';
+    g.fillRect(xe, y0, Math.max(0, cx - xe), h);
+    g.strokeStyle = C.accent;
+    g.lineWidth = 2;
+    g.beginPath();
+    g.moveTo(xs, y0);
+    g.lineTo(xs, y0 + h);
+    g.moveTo(xe, y0);
+    g.lineTo(xe, y0 + h);
+    g.stroke();
+    g.fillStyle = C.accent;
+    g.font = '700 10px "JetBrains Mono", ui-monospace, monospace';
+    g.fillText(`${loop.kind === 'loop-roll' ? 'LOOP ROLL' : loop.kind === 'hold' ? 'BOUCLE (attente)' : 'BOUCLE'} ${fmtLoop(loop.beats)}`, Math.max(x0 + 30, xs + 4), y0 + 30);
   }
 
   // temps du groove (re-edit) calé sur cette platine : petits marqueurs en bas de la voie
@@ -262,6 +288,8 @@ function drawOverview(
   wf: Waveform | undefined,
   plan: TransitionPlan | undefined,
   now: number,
+  entryPos?: number,
+  scan?: { trackId: number; coverage: number },
 ) {
   g.fillStyle = '#121214';
   g.fillRect(x0, y0, w, h);
@@ -316,6 +344,34 @@ function drawOverview(
     g.fillRect(xs, y0, Math.max(2, xe - xs), h);
     g.fillStyle = C.accent;
     g.fillRect(Math.round(xs), y0, 2, h);
+  }
+  // drops repérés (structure du morceau complet)
+  const drops = v.state.analysis?.structure?.dropPositions ?? [];
+  g.fillStyle = C.mid;
+  for (const d of drops.slice(0, 6)) {
+    const x = x0 + d * pxs;
+    g.beginPath();
+    g.moveTo(x - 4, y0);
+    g.lineTo(x + 4, y0);
+    g.lineTo(x, y0 + 6);
+    g.fill();
+  }
+  // point d'entrée choisi par le cerveau (platine pas encore à l'antenne)
+  if (entryPos !== undefined && !v.playing && !plan) {
+    const x = x0 + entryPos * pxs;
+    g.fillStyle = C.accent;
+    g.fillRect(Math.round(x), y0, 2, h);
+    g.font = '700 9px "JetBrains Mono", ui-monospace, monospace';
+    g.fillText('ENTRÉE', x + 4, y0 + h - 4);
+  }
+  if (scan) {
+    const label = `Analyse du morceau ${Math.round(scan.coverage * 100)} %`;
+    g.font = '700 10px "JetBrains Mono", ui-monospace, monospace';
+    const tw = g.measureText(label).width;
+    g.fillStyle = 'rgba(11,11,12,0.8)';
+    g.fillRect(x0 + w - tw - 16, y0 + 2, tw + 12, h - 4);
+    g.fillStyle = C.accent;
+    g.fillText(label, x0 + w - tw - 10, y0 + h / 2 + 3);
   }
   g.fillStyle = C.text;
   g.fillRect(Math.round(px), y0 - 1, 2, h + 2);
