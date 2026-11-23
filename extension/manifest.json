@@ -2,7 +2,7 @@
   "manifest_version": 3,
   "name": "Club Maison",
   "short_name": "Club Maison",
-  "version": "0.1.2",
+  "version": "0.2.0",
   "description": "DJ automatique pour une soirée à la maison : pilote deux lecteurs Deezer et mixe leur son.",
   "minimum_chrome_version": "116",
   "permissions": ["tabCapture", "tabs", "storage", "scripting", "activeTab"],
