@@ -22,3 +22,5 @@ export {
   interp, valueAt, valueAtPoints, djFilterToNodes, renderGate, generateImpulse,
 } from './params';
 export type { ParamSpec } from './params';
+export { stingerSchedule, stingerEnd, playStinger, isStinger, STINGER_KINDS } from './stingers';
+export type { StingerKind, StingerNote } from './stingers';

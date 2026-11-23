@@ -320,6 +320,10 @@ function SettingsTab({ engine, settings, onSaveSettings }: Props) {
           <input type="checkbox" checked={dj.followCrowd} onChange={(e) => upd({ followCrowd: e.target.checked })} />
           Suivre le public (votes et demandes)
         </label>
+        <label className="check">
+          <input type="checkbox" checked={dj.stingers !== false} onChange={(e) => upd({ stingers: e.target.checked })} />
+          Sons d’ambiance (corne, sirène, scratch)
+        </label>
         <label>
           Genre de base
           <select value={dj.baseGenre} onChange={(e) => upd({ baseGenre: e.target.value as Genre })}>

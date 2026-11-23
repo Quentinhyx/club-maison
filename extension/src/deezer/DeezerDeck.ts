@@ -85,10 +85,14 @@ export class DeezerDeck implements DeckController {
   }
 
   async pause(): Promise<void> {
+    // optimiste : le chef d'orchestre doit voir la platine arrêtée tout de suite (fin de pré-écoute)
+    if (this.state.status === 'playing') this.state = { ...this.state, status: 'paused' };
+    this.snap = undefined;
     await this.bridge.command(this.id, { op: 'pause' }, 5000);
   }
 
   async seek(position: number): Promise<void> {
+    this.state = { ...this.state, position };
     await this.bridge.command(this.id, { op: 'seek', position }, 6000);
   }
 

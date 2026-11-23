@@ -484,6 +484,10 @@ export class Conductor {
       out[c.target] = { deck: c.target, atCtx: c.atCtx, beats, bpm: c.bpm, kind: c.kind };
     }
     const tr = this.tr;
+    if (tr && tr.plan.technique === 'loop-roll' && now >= tr.plan.startCtx && now < tr.plan.incomingStartCtx && !out[tr.plan.from]) {
+      const k = Math.min(3, Math.floor(((now - tr.plan.startCtx) / Math.max(0.01, tr.plan.incomingStartCtx - tr.plan.startCtx)) * 4));
+      out[tr.plan.from] = { deck: tr.plan.from, atCtx: tr.plan.startCtx, beats: 1 / Math.pow(2, k), bpm: tr.plan.bpm, kind: 'loop-roll' };
+    }
     if (tr && tr.hold === 'holding' && tr.plan.holdWithLoop !== false && !out[tr.plan.from]) {
       out[tr.plan.from] = { deck: tr.plan.from, atCtx: tr.holdStartedAt ?? now, beats: 4, bpm: tr.plan.bpm, kind: 'hold' };
     }
@@ -975,6 +979,7 @@ export class Conductor {
       this.log('warn', 'Transition refusée : une autre est déjà en cours.');
       return;
     }
+    this.stopScan(plan.to, 'transition'); // avant de lire l'état : la pré-écoute rend la platine à l'arrêt
     const deck = this.d.decks[plan.to];
     const st = deck.getState();
     const stillLoading = st.status === 'loading' || this.loading[plan.to] !== undefined;
@@ -987,7 +992,6 @@ export class Conductor {
       return;
     }
     if (stillLoading) this.log('warn', `Platine ${plan.to} encore en chargement : la boucle tiendra le sortant si besoin.`);
-    this.stopScan(plan.to, 'transition');
     const spb = 60 / plan.bpm;
     const lat = Math.max(0, this.d.startLatency?.(plan.to) ?? 0);
     const rate = st.caps.canSetRate ? plan.incomingRate : 1;

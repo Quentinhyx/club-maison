@@ -11,6 +11,7 @@
  *   canal groove : GrooveMachine (synthèse) -> EQ basse -> filtre DJ -> fader -> bus master
  *                  (+ envois écho / réverb post-fader, à 0 par défaut, voir setGrooveSends)
  */
+import { isStinger, playStinger } from './stingers';
 import type {
   AutomationLane, AutomationPoint, DeckId, FxCue, GroovePlan, GrooveStyle, ParamTarget,
   TransitionPlan,
@@ -76,6 +77,7 @@ export class Mixer {
   private readonly nodes: AudioNode[] = [];
   private readonly gate: GainNode;
   private readonly noiseSrc: AudioBufferSourceNode;
+  private readonly stingerBus: GainNode;
   private readonly masterMeter: AnalyserNode;
   private readonly meterBuf: Float32Array<ArrayBuffer>;
   private readonly groove: GrooveMachine;
@@ -152,6 +154,12 @@ export class Mixer {
     const noiseGain = gain(0);
     this.noiseSrc.connect(noiseBP).connect(noiseGain).connect(bus);
     this.noiseSrc.start();
+
+    // ---------------- sons d'ambiance (corne de brume, sirène, scratch) ----------------
+    this.stingerBus = gain(0.7);
+    const stingerEcho = gain(0.22);
+    this.stingerBus.connect(bus);
+    this.stingerBus.connect(stingerEcho).connect(echoIn);
 
     // ---------------- tranches ----------------
     const mkStrip = (d: DeckId): Strip => {
@@ -346,6 +354,10 @@ export class Mixer {
    */
   fx(cue: FxCue): AutomationLane[] {
     this.setTempo(cue.bpm);
+    if (isStinger(cue.kind)) {
+      if (!this.disposed) playStinger(this.ctx, this.stingerBus, cue.kind, cue.atCtx, cue.bpm, cue.beats, cue.amount);
+      return [];
+    }
     const lanes = fxToAutomation(cue).filter((lane) => {
       const first = lane.points[0]?.t ?? cue.atCtx;
       const rec = this.record.get(lane.target) ?? [];

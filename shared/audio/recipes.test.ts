@@ -16,6 +16,7 @@ import {
 } from './params';
 import { brakeBeats, fxToAutomation, planToAutomation, transitionLanes } from './recipes';
 import { phaseNudge, rateRamp, tempoMatchRate } from './sync';
+import { isStinger, stingerEnd, stingerSchedule } from './stingers';
 
 let passed = 0;
 let failed = 0;
@@ -674,6 +675,26 @@ test('fxLoopActions : loop (hold puis release) et loop-roll (raccourcit, coupure
   assert.equal(val(lanes, 'B.gain', 10 + 9 * beat + 0.001, 0), 1);
   assert.ok(val(lanes, 'B.filter', 10 + 8 * beat - 0.001, 0) > 0.5, 'pas de passe-haut qui monte');
   assert.deepEqual(fxLoopActions({ kind: 'gate', target: 'A', atCtx: 0, beats: 4, bpm: 120, amount: 1 }), []);
+});
+
+
+test('sons d’ambiance : calés sur le tempo, bornés, sans automation', () => {
+  const bpm = 125;
+  const beat = 60 / bpm;
+  const horn = stingerSchedule('airhorn', 10, bpm, 2, 0.8);
+  assert.equal(horn.length, 4);
+  horn.slice(0, 3).forEach((n, i) => assert.ok(Math.abs(n.t - (10 + (i * beat) / 4)) < 1e-9));
+  assert.ok(horn[3].dur > beat);
+  const siren = stingerSchedule('siren', 5, bpm, 4, 1);
+  assert.equal(siren.length, 8);
+  assert.ok(Math.abs(stingerEnd(siren) - (5 + 4 * beat)) < 1e-9);
+  const scr = stingerSchedule('scratch', 0, bpm, 1, 0.5);
+  assert.ok(scr.every((n) => n.level <= 0.5 && n.f0 > 0 && n.f1 > 0));
+  for (const k of ['airhorn', 'siren', 'scratch'] as const) {
+    assert.ok(isStinger(k));
+    assert.deepEqual(fxToAutomation({ kind: k, target: 'master', atCtx: 1, beats: 2, bpm, amount: 1 }), []);
+  }
+  assert.ok(!isStinger('echo-throw'));
 });
 
 console.log(`\n${passed} réussi(s), ${failed} échec(s)\n`);

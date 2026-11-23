@@ -8,7 +8,7 @@ import type { DeckId, ParamTarget } from '../../../shared/contracts';
 import type { Engine } from '../engine';
 import type { MixerLike } from '../conductor';
 import { getFrame, phaseDiff, useFrame } from './frame';
-import { fmtLoop } from './labels';
+import { FX_LABELS, STINGER_KINDS, fmtLoop } from './labels';
 
 const EQ_MIN = -26;
 const EQ_MAX = 6;
@@ -145,6 +145,15 @@ export function MixerPanel({ engine, manual }: { engine: Engine; manual: boolean
       const s = on ? `${Math.round(Math.min(1, v) * 100)}` : '—';
       if (val && val.textContent !== s) val.textContent = s;
     }
+    // sons d'ambiance (corne, sirène, scratch) : LED pendant le son
+    const sel = leds.current.SFX;
+    if (sel) {
+      const fx = f.activeFx.find((x) => (STINGER_KINDS as readonly string[]).includes(x.cue.kind) && x.cue.atCtx <= f.now && x.endCtx > f.now);
+      sel.dataset.on = fx ? '1' : '0';
+      const val = sel.querySelector('.v');
+      const s = fx ? FX_LABELS[fx.cue.kind].split(' ')[0].toUpperCase() : '—';
+      if (val && val.textContent !== s) val.textContent = s;
+    }
     // boucle : LED avec la longueur (A 1/2, B 4…)
     const loops = engine.conductor.getLoops();
     const lel = leds.current.LOOP;
@@ -274,7 +283,7 @@ export function MixerPanel({ engine, manual }: { engine: Engine; manual: boolean
           <div className="ch-name">MASTER</div>
           <canvas className="vu vu-master" ref={(el) => { vu.current.M = el; }} />
           <div className="leds">
-            {['ECHO', 'REVERB', 'RISER', 'GATE', 'FILTER', 'LOOP'].map((k) => (
+            {['ECHO', 'REVERB', 'RISER', 'GATE', 'FILTER', 'LOOP', 'SFX'].map((k) => (
               <div className="led" key={k} ref={(el) => { leds.current[k] = el; }} data-on="0">
                 <i />
                 <span className="k">{k}</span>

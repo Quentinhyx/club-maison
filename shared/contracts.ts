@@ -264,7 +264,11 @@ export type FxKind =
   | 'gate'            // stutter rythmique
   | 'brake'
   | 'loop'            // vraie boucle : rejoue les derniers `loopBeats` temps captés de la platine (échantillonneur)
-  | 'loop-roll';      // boucle qui raccourcit (1 -> 1/2 -> 1/4 -> 1/8 temps) jusqu'au drop
+  | 'loop-roll'       // boucle qui raccourcit (1 -> 1/2 -> 1/4 -> 1/8 temps) jusqu'au drop
+  // Sons d'ambiance « boîte » générés par la table (DjSettings.stingers), à placer avec parcimonie :
+  | 'airhorn'         // corne de brume « pa-pa-paaa » calée sur les doubles-croches, sur un gros drop
+  | 'siren'           // sirène qui monte et descend, pendant une montée
+  | 'scratch';        // scratch de vinyle sur la grille, juste avant un drop ou un changement
 
 export interface FxCue {
   kind: FxKind;
@@ -359,6 +363,8 @@ export interface DjSettings {
   followCrowd: boolean;
   /** Autorise les re-edits (morceau ralenti/accéléré jusqu'à ±30 % + boîte à rythmes). Optionnel, défaut true. */
   allowReEdits?: boolean;
+  /** Sons d'ambiance générés par la table (corne de brume, sirène, scratch). Optionnel, défaut true. */
+  stingers?: boolean;
   /** Tempo cible de la soirée (le cerveau le fait évoluer) ; absent = déduit du profil. */
   targetBpm?: number;
   /** Genre de départ / courant si personne ne vote. */

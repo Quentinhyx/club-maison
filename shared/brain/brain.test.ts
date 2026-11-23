@@ -11,7 +11,7 @@ import type {
 import { GENRES, GENRE_LABELS, RATE_LIMITS } from '../contracts';
 import {
   camelotDistance, chooseTechnique, createBrain, DEFAULT_SETTINGS, GENRE_BPM, GENRE_GRAPH, genrePath, harmonicScore,
-  checkReEdit, isElectronic, NO_GRID_TECHNIQUES, scoreCandidate, STYLE_PROFILES, SYNC_TECHNIQUES, targetBpmAt, tempoMatch,
+  checkReEdit, chooseEntryPoint, entryKindFor, isElectronic, NO_GRID_TECHNIQUES, scoreCandidate, STYLE_PROFILES, SYNC_TECHNIQUES, targetBpmAt, tempoMatch,
 } from './index';
 import type { ScoreContext } from './index';
 
@@ -586,7 +586,7 @@ test('chooseTechnique : filtres', () => {
       const profile = STYLE_PROFILES[id];
       for (const situation of ['same-genre', 'genre-change', 'tempo-jump', 'breakdown', 'outro', 'emergency'] as const) {
         const noGrid = chooseTechnique({ profile, situation, syncOk: true, beatReliable: false, outgoingGenre: 'tech-house', incomingGenre: 'house', random: r });
-        assert.ok(NO_GRID_TECHNIQUES.has(noGrid), `${id}/${situation} grille peu fiable -> ${noGrid}`);
+        assert.ok(NO_GRID_TECHNIQUES.has(noGrid) || (noGrid === 'loop-roll' && profile.rollWithoutGrid), `${id}/${situation} grille peu fiable -> ${noGrid}`);
         const noSync = chooseTechnique({ profile, situation, syncOk: false, beatReliable: true, outgoingGenre: 'tech-house', incomingGenre: 'rap-fr', random: r });
         assert.ok(!SYNC_TECHNIQUES.has(noSync), `${id}/${situation} sans calage -> ${noSync}`);
         if (id === 'lounge') {
@@ -956,6 +956,212 @@ test('re-edits pendant une soirée open-format (vote 80s depuis la house)', () =
   console.log(`     re-edits en open-format : ${n}, morceaux : ${sim.played().length}`);
   assert.ok(n >= 1, 'au moins un re-edit');
   assert.ok(n <= sim.played().length / 2, 're-edits dosés');
+});
+
+// --------------------------------------------------------------------------------------------- profil soirée, structure, suivant
+
+/** Simule jusqu'à ce qu'un morceau joue seul (pas de transition en cours) depuis au moins `sec` s. */
+function untilSolo(sim: Sim, sec: number, guardMin = 15): void {
+  let g = 0;
+  while (g++ < guardMin * 600) {
+    sim.step();
+    const pd = sim.playingDeck();
+    if (!sim.active && pd && sim.nowCtx - pd.startedCtx > sec && sim.nowCtx - (sim.transitions.at(-1)?.endCtx ?? 0) > sec) return;
+  }
+  throw new Error('pas de morceau seul');
+}
+
+function techSummary(sim: Sim): string {
+  const c: Record<string, number> = {};
+  for (const t of sim.mixes()) c[t.plan.technique] = (c[t.plan.technique] ?? 0) + 1;
+  return Object.entries(c).map(([a, b]) => `${a} ×${b}`).join(', ');
+}
+
+test('profil soirée par défaut', () => {
+  assert.equal(DEFAULT_SETTINGS.style, 'soiree');
+  assert.equal(DEFAULT_SETTINGS.maxPlaySeconds, 180);
+  assert.equal(DEFAULT_SETTINGS.minPlaySeconds, 30);
+  assert.equal(STYLE_PROFILES.soiree.incomingEntry, 'hot');
+});
+
+test('soirée 30 min : morceaux courts, rolls, entrée sur le moment fort, jamais jusqu’au bout', () => {
+  const sim = new Sim({ seed: 51, style: 'soiree', maxPlay: 180 });
+  sim.crowd.genreWeights = {};
+  sim.runFor(30 * 60);
+  checkInvariants(sim, 'soirée');
+  const m = sim.mixes();
+  const avg = sim.avgPlay();
+  assert.ok(avg >= 60 && avg <= 150, `durée moyenne ${avg.toFixed(0)} s`);
+  const rolls = m.filter((t) => t.plan.technique === 'loop-roll').length + sim.fx.filter((f) => f.cue.kind === 'loop-roll').length;
+  assert.ok(rolls >= 3, `loop-roll (${rolls})`);
+  assert.ok(m.filter((t) => t.plan.incomingStartPos > 0).length > m.length / 2, 'entrée après le début pour la majorité');
+  for (const t of m) {
+    assert.ok((t.played ?? 0) <= 181 && t.endsBeforeOut, `${t.plan.id} joué jusqu'au bout`);
+    const ld = sim.loads.filter((l) => l.track.id === t.inTrack.id).at(-1)!;
+    assert.ok(ld.now <= t.plan.startCtx - 19.9 || /forcée/.test(t.plan.reason), `${t.plan.id} : load ${(t.plan.startCtx - ld.now).toFixed(1)} s avant`);
+    assert.ok(t.plan.preRollBeats === 8 || t.plan.preRollBeats === 16);
+  }
+  const loops = sim.fx.filter((f) => f.cue.kind === 'loop');
+  assert.ok(loops.every((f) => f.cue.loopBeats === 1 || f.cue.loopBeats === 2));
+  console.log(`     soirée 30 min : ${sim.played().length} morceaux, ${avg.toFixed(0)} s en moyenne ; ${techSummary(sim)} ; effets : ${Object.entries(sim.fx.reduce((a: Record<string, number>, f) => { a[f.cue.kind] = (a[f.cue.kind] ?? 0) + 1; return a; }, {})).map(([a, b]) => `${a} ×${b}`).join(', ')}`);
+  const ex = m.find((t) => /drop swap/.test(t.plan.reason)) ?? m[1];
+  console.log(`     exemple : ${ex.plan.reason}`);
+});
+
+test('soirée, grille peu fiable : sortie décidée, sans calage', () => {
+  const sim = new Sim({ seed: 54, style: 'soiree', maxPlay: 180, beatConfidence: 0.2 });
+  sim.runFor(25 * 60);
+  checkInvariants(sim, 'soirée beat faible');
+  for (const t of sim.mixes()) {
+    assert.ok(NO_GRID_TECHNIQUES.has(t.plan.technique) || t.plan.technique === 'loop-roll', t.plan.technique);
+    assert.ok((t.played ?? 0) <= 181);
+  }
+  assert.ok(sim.avgPlay() <= 150, `durée ${sim.avgPlay().toFixed(0)} s`);
+});
+
+test('accord des sections (unitaire)', () => {
+  assert.equal(entryKindFor('drop', false, true), 'drop');
+  assert.equal(entryKindFor('breakdown', false, true), 'build');
+  assert.equal(entryKindFor('build', false, true), 'build');
+  assert.equal(entryKindFor('build', true, true), 'drop');
+  assert.equal(entryKindFor('outro', false, true), 'rhythmic');
+  const t = byGenre('tech-house')[0];
+  const st = structureOf(t);
+  const nb = 60 / st.bpm;
+  const base = { structure: st, duration: t.track.duration, bpm: st.bpm, genre: 'tech-house' as Genre, hot: true, longPlay: false, trackId: t.track.id };
+  const drop = chooseEntryPoint({ ...base, kind: 'drop' });
+  assert.ok(Math.abs(drop.pos - st.dropPositions[0]) < nb, `drop ${drop.pos} vs ${st.dropPositions[0]}`);
+  const first = chooseEntryPoint({ ...base, kind: 'drop', longPlay: true });
+  assert.ok(Math.abs(first.pos - Math.min(...st.dropPositions)) < nb, 'premier drop si on fait durer');
+  const build = chooseEntryPoint({ ...base, kind: 'build' });
+  const sec = st.sections.find((x) => x.startPos <= build.pos + 0.01 && build.pos + 0.01 < x.endPos)!.section;
+  assert.equal(sec, 'build');
+  assert.ok(Math.abs(build.pos + 32 * nb - st.dropPositions[0]) < nb, 'le drop tombe à la fin de la montée');
+  const rhy = chooseEntryPoint({ ...base, kind: 'rhythmic' });
+  assert.ok(rhy.pos > 0, 'jamais 0 en soirée');
+  for (const e of [drop, first, build, rhy]) {
+    const k = (e.pos - st.firstDownbeatPos) / (32 * nb);
+    assert.ok(Math.abs(k - Math.round(k)) < 1e-3, 'début de phrase');
+  }
+  // sans structure : heuristique
+  const pop = byGenre('pop')[3].track;
+  const h = chooseEntryPoint({ duration: pop.duration, bpm: 110, genre: 'pop', kind: 'drop', hot: true, longPlay: false, trackId: pop.id });
+  assert.ok(h.pos >= pop.duration * 0.2 && h.pos <= pop.duration * 0.4 && h.pos <= pop.duration - 60, `refrain estimé ${h.pos}`);
+  const th = chooseEntryPoint({ duration: 330, bpm: 125, genre: 'tech-house', kind: 'drop', hot: true, longPlay: false, trackId: 1 });
+  assert.ok(Math.abs(th.pos - 64 * 60 / 125) < 1e-3);
+});
+
+test('structure connue : l’entrant entre sur son drop, sections accordées', () => {
+  const sim = new Sim({ seed: 52, style: 'soiree', maxPlay: 180, structure: true });
+  sim.runFor(40 * 60);
+  checkInvariants(sim, 'structure');
+  let onDrop = 0;
+  let onBuild = 0;
+  for (const t of sim.mixes()) {
+    if (/Suivant demandé/.test(t.plan.reason)) continue;
+    const st = structureOf(CATALOGUE.get(t.inTrack.id)!);
+    const nb = 60 / st.bpm;
+    const inSec = st.sections.find((x) => x.startPos <= t.plan.incomingStartPos + 0.01 && t.plan.incomingStartPos + 0.01 < x.endPos)?.section;
+    const dropSwap = /drop swap/.test(t.plan.reason);
+    if (t.outSectionEnd === 'drop' || dropSwap) {
+      if (SYNC_TECHNIQUES.has(t.plan.technique)) continue;
+      assert.ok(st.dropPositions.some((d) => Math.abs(d - t.plan.incomingStartPos) < nb), `${t.plan.id} : pas sur un drop (${t.plan.incomingStartPos.toFixed(1)})`);
+      onDrop++;
+    } else if (t.outSectionEnd === 'breakdown' || t.outSectionEnd === 'build') {
+      assert.equal(inSec, 'build', `${t.plan.id} : sortant en ${t.outSectionEnd}, entrant en ${inSec}`);
+      onBuild++;
+    }
+    assert.match(t.plan.reason, /entrée sur/);
+  }
+  console.log(`     entrées sur un drop : ${onDrop}, sur une montée : ${onBuild}`);
+  assert.ok(onDrop >= 2, 'des entrées sur le drop');
+  assert.ok(onBuild >= 1, 'une entrée sur une montée après un breakdown');
+});
+
+test('structure arrivant tard : point de départ replanifié', () => {
+  const sim = new Sim({ seed: 53, style: 'soiree', maxPlay: 180, structure: true, structureDelay: 5 });
+  sim.runFor(15 * 60);
+  checkInvariants(sim, 'structure tardive');
+  const re = sim.logs.filter((l) => /Structure reçue/.test(l));
+  assert.ok(re.length >= 1, 'replanification journalisée');
+  const byTrack = new Map<number, number[]>();
+  for (const l of sim.loads) byTrack.set(l.track.id, [...(byTrack.get(l.track.id) ?? []), l.startAt]);
+  const twice = [...byTrack.entries()].filter(([, v]) => v.length >= 2 && v[0] !== v[v.length - 1]);
+  assert.ok(twice.length >= 1, 'nouveau load avec un autre startAt');
+  const [id, starts] = twice[0];
+  const st = structureOf(CATALOGUE.get(id)!);
+  assert.ok(st.dropPositions.some((d) => Math.abs(d - starts[starts.length - 1]) < 60 / st.bpm), 'recalé sur un drop');
+});
+
+test('suivant : sortie dans les 4 temps, technique courte, pas de double transition', () => {
+  const sim = new Sim({ seed: 61, style: 'soiree', maxPlay: 180 });
+  untilSolo(sim, 20);
+  const n = sim.transitions.length;
+  const skipped = sim.playingDeck()!.track!;
+  const bpm = sim.playingDeck()!.analysis!.bpm * sim.playingDeck()!.rate;
+  const t0 = sim.nowCtx;
+  sim.skipAt = sim.nowMs;
+  sim.runFor(0.3);
+  assert.equal(sim.transitions.length, n + 1, 'une transition');
+  const t = sim.transitions[n];
+  assert.ok(t.plan.startCtx - t0 <= (4 * 60) / bpm + 0.2, `sortie après ${(t.plan.startCtx - t0).toFixed(2)} s`);
+  assert.ok(['echo-out', 'cut', 'loop-roll'].includes(t.plan.technique) && t.plan.beats <= 4, t.plan.technique);
+  assert.match(t.plan.reason, /Suivant demandé.*Je m'éloigne de/);
+  sim.runFor(20 * 60);
+  checkInvariants(sim, 'suivant');
+  const after = sim.history.filter((h) => h.startedAt > sim.nowMs - 20 * 60000 - 1000);
+  assert.ok(!after.some((h) => h.track.artist === skipped.artist && h.track.id !== skipped.id), 'artiste zappé non rejoué');
+});
+
+test('suivant pendant une transition : raccourcie', () => {
+  const sim = new Sim({ seed: 62 });
+  let g = 0;
+  while (g++ < 30 * 600) {
+    sim.step();
+    const a = sim.active;
+    if (a && a.beats >= 16 && sim.nowCtx > a.startCtx + 1 && sim.transitions.length >= 2) break;
+  }
+  const rec = sim.transitions.at(-1)!;
+  const endBefore = rec.endCtx;
+  const n = sim.transitions.length;
+  sim.skipAt = sim.nowMs;
+  sim.runFor(0.3);
+  assert.equal(sim.transitions.length, n, 'pas de nouvelle transition');
+  assert.ok(rec.shortened && rec.endCtx < endBefore - 1, `raccourcie (${endBefore.toFixed(1)} -> ${rec.endCtx.toFixed(1)})`);
+  sim.runFor(5 * 60);
+  checkInvariants(sim, 'raccourcie');
+});
+
+test('deux zappages dans le même genre : changement de registre', () => {
+  const sim = new Sim({ seed: 63, style: 'soiree', maxPlay: 180 });
+  untilSolo(sim, 20);
+  sim.skipAt = sim.nowMs;
+  untilSolo(sim, 15);
+  const g2 = sim.genreOf(sim.playingDeck()!.track);
+  assert.equal(g2, 'tech-house');
+  sim.skipAt = sim.nowMs;
+  sim.runFor(10 * 60);
+  checkInvariants(sim, 'deux zappages');
+  assert.ok(sim.logs.some((l) => /zappages en Tech house.*change de registre/.test(l)), 'changement journalisé');
+  const last = sim.playedGenres().slice(-3);
+  assert.ok(last.some((g) => g !== 'tech-house'), `nouveau registre (${last.join(', ')})`);
+});
+
+test('file vide sans vote : même registre, candidats similaires préférés', () => {
+  const sim = new Sim({ seed: 71, similar: true });
+  sim.runFor(5 * 60);
+  sim.settings.baseGenre = 'house';
+  sim.runFor(40 * 60);
+  checkInvariants(sim, 'même registre');
+  assert.ok(sim.playedGenres().every((g) => g === 'tech-house'), `reste en tech house (${[...new Set(sim.playedGenres())].join(', ')})`);
+  const rest = sim.played().slice(1);
+  const sim2 = rest.filter((t) => t.id % 4 === 0).length;
+  assert.ok(sim2 / rest.length > 0.5, `similaires ${sim2}/${rest.length}`);
+  const keys = sim.played().map((t) => t.artist);
+  for (let i = 0; i < keys.length; i++) {
+    const w = keys.slice(Math.max(0, i - 5), i + 1);
+    assert.ok(w.filter((k) => k === keys[i]).length <= 2, 'pas plus de 2 fois le même artiste sur 6');
+  }
 });
 
 // --------------------------------------------------------------------------------------------- soirée de 2 h

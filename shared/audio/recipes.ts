@@ -5,6 +5,7 @@
  * Toutes les recettes sont calées sur la grille : beat = 60 / bpm, startCtx = début de phrase.
  * Le « 1 » d'arrivée de l'entrant, pour les techniques à drop, est startCtx + beats * beat.
  */
+import { isStinger } from './stingers';
 import type {
   AutomationLane, AutomationPoint, Curve, DeckId, DeckParam, FxCue, MasterParam, ParamTarget,
   TransitionPlan,
@@ -390,6 +391,8 @@ export function echoDivision(beats: number): number {
 }
 
 export function fxToAutomation(cue: FxCue): AutomationLane[] {
+  // les sons d'ambiance sont joués par la table elle-même (stingers.ts) : aucune automation
+  if (isStinger(cue.kind)) return [];
   const bpm = clamp(Number.isFinite(cue.bpm) ? cue.bpm : 120, 40, 250);
   const beat = 60 / bpm;
   const A = clamp(Number.isFinite(cue.amount) ? cue.amount : 0.5, 0, 1);

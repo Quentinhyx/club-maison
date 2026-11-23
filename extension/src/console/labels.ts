@@ -23,7 +23,12 @@ export const FX_LABELS: Record<FxKind, string> = {
   brake: 'Frein',
   loop: 'Boucle',
   'loop-roll': 'Loop roll',
+  airhorn: 'Corne de brume',
+  siren: 'Sirène',
+  scratch: 'Scratch',
 };
+
+export const STINGER_KINDS = ['airhorn', 'siren', 'scratch'] as const;
 
 export const STYLE_LABELS: Partial<Record<StyleProfileId, string>> = {
   soiree: 'Soirée',
