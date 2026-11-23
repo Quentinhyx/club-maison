@@ -35,7 +35,16 @@ export class GuestApi implements GuestApiLike {
       const name = (e as Error)?.name;
       throw new Error(name === 'TimeoutError' || name === 'AbortError' ? 'API invités : pas de réponse (8 s)' : 'API invités injoignable (réseau)');
     }
-    if (!res.ok) throw new Error(apiErrorMessage(res.status));
+    if (!res.ok) {
+      let code: string | undefined;
+      try {
+        const j = await res.clone().json();
+        code = j?.code ?? j?.error?.code ?? (typeof j?.error === 'string' ? j.error : undefined);
+      } catch {
+        /* pas de JSON */
+      }
+      throw new Error(apiErrorMessage(res.status, code));
+    }
     return res;
   }
 
@@ -49,7 +58,8 @@ export class GuestApi implements GuestApiLike {
   }
 
   async getState(): Promise<PartyState> {
-    const res = await this.call('/api/state', { headers: { accept: 'application/json' } });
+    // host=1 + clé : jamais la copie publique en cache (skipAt, demandes en attente)
+    const res = await this.call('/api/state?host=1', { headers: { accept: 'application/json', 'x-host-key': this.hostKey } });
     return (await res.json()) as PartyState;
   }
 
@@ -71,7 +81,10 @@ function timeoutSignal(ms: number): AbortSignal | undefined {
 }
 
 /** Message affiché dans l'onglet Invités selon le code HTTP. */
-export function apiErrorMessage(status: number): string {
+export function apiErrorMessage(status: number, code?: string): string {
+  if (code === 'host-locked') return 'Trop d’essais de clé hôte, réessaie dans 10 min.';
+  if (code === 'queue-full') return 'File des demandes pleine.';
+  if (status === 429 || code === 'rate-limited') return 'Trop de requêtes vers l’API invités, ralentissement.';
   if (status === 401 || status === 403) return 'Clé hôte refusée : vérifie la clé dans Réglages.';
   if (status === 503) return 'HOST_KEY manquante sur Vercel : ajoute la variable d’environnement puis redéploie.';
   if (status === 404) return 'API invités introuvable : vérifie l’adresse dans Réglages.';

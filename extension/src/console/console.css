@@ -518,3 +518,37 @@ input[type='checkbox'], input[type='radio'] { accent-color: var(--accent); }
   .counters .beats i { width: 18px; }
   .phrase { font-size: 12px; }
 }
+
+/* erreurs de l'API invités */
+.g-err { margin: 0 10px 6px; padding: 5px 8px; font-size: 11px; color: var(--live); border: 1px solid rgba(255, 59, 48, 0.45); border-radius: 2px; }
+
+/* bandeaux d'alerte (son en pause, platine sans son) */
+.app > .banner {
+  position: fixed;
+  left: 50%;
+  transform: translateX(-50%);
+  top: 52px;
+  z-index: 20;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  max-width: min(900px, 92vw);
+  padding: 10px 14px;
+  background: #1a0d0c;
+  color: var(--text);
+  border: 1px solid var(--live);
+  border-radius: 3px;
+  font: 600 13px var(--font-title);
+  box-shadow: 0 8px 30px rgba(0, 0, 0, 0.6);
+}
+.app > .banner + .banner { top: 104px; }
+.app > .banner button { border-color: var(--live); color: var(--text); }
+.app > .banner-big {
+  top: 40%;
+  font-size: 18px;
+  padding: 22px 28px;
+  cursor: pointer;
+  background: var(--live);
+  color: #fff;
+  border: 0;
+}

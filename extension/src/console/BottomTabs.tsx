@@ -222,8 +222,7 @@ function GuestsTab({ engine, snap, settings }: Props) {
           <span className={`pill ${snap.guest.ok ? 'ok' : 'ko'}`}>{snap.guest.ok ? 'API connectée' : snap.guest.lastError ? 'API en erreur' : 'connexion…'}</span>
         </div>
         {!snap.guest.ok && snap.guest.lastError && <div className="g-err">{snap.guest.lastError}</div>}
-        <div className="g-head" style={{ display: 'none' }}>
-        </div>
+        {snap.guest.storage === 'memory' && <div className="g-err">Base de données non branchée sur Vercel : les votes peuvent se perdre.</div>}
         <div className="energy">
           <span className="lbl">ÉNERGIE DEMANDÉE</span>
           <div className="en-track">

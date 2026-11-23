@@ -170,7 +170,7 @@ export interface ConductorSnapshot {
   candidates: number;
   analyzing: number;
   history: PlayedTrack[];
-  guest: { configured: boolean; ok: boolean; lastError?: string; lastOkMs?: number };
+  guest: { configured: boolean; ok: boolean; lastError?: string; lastOkMs?: number; storage?: 'redis' | 'memory' };
   currentGenre?: Genre;
   groove?: GrooveView;
   baseRate: Record<DeckId, number>;
@@ -1741,7 +1741,7 @@ export class Conductor {
         this.lastHostSkip = skipAt;
         if (!first && this.d.nowMs() - skipAt < 60_000) this.requestSkip('téléphone de l’hôte');
       }
-      this.guestStatus = { configured: true, ok: true, lastOkMs: this.d.nowMs() };
+      this.guestStatus = { configured: true, ok: true, lastOkMs: this.d.nowMs(), storage: (st as { storage?: 'redis' | 'memory' }).storage };
     } catch (e) {
       this.guestStatus = { ...this.guestStatus, configured: true, ok: false, lastError: errMsg(e) };
     }

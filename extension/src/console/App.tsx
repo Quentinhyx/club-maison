@@ -162,9 +162,9 @@ export function App({ initial }: { initial: ConsoleSettings }) {
           <span>
             Platine {d} sans son :{' '}
             {engine.mode === 'deezer'
-              ? `clique sur l’icône Club Maison dans l’onglet Deezer ${d === 'B' ? 'privé' : 'normal'}, puis sur Reconnecter.`
-              : 'la soirée continue sur l’autre platine.'}{' '}
-            La soirée continue sur l’autre platine.
+              ? `clique sur l’icône Club Maison dans l’onglet Deezer ${d === 'B' ? 'privé' : 'normal'}, puis sur Reconnecter. `
+              : ''}
+            {deadBanner.length > 1 ? 'Aucune platine n’a de son pour l’instant.' : 'La soirée continue sur l’autre platine.'}
           </span>
           <button onClick={() => void engine.reconnect(d)}>Reconnecter</button>
         </div>
